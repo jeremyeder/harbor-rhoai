@@ -31,16 +31,20 @@ if [ ${PIPESTATUS[0]} -ne 0 ]; then
     REWARD=0
 fi
 
-# Stage 2: Feature verification — confirm new test functions exist and pass
+# Stage 2: Feature verification — confirm deletion and aggregation tests exist and pass
 echo "=== Stage 2: Feature verification ==="
-go test -count=1 -v -run "TestComputeComponentsStatus|TestUpdateDSCStatus.*Delet" \
+STAGE2_OUTPUT=$(go test -count=1 -v -run "TestComputeComponentsStatus|Delet" \
     ./internal/controller/components/dashboard/... \
     ./internal/controller/components/kserve/... \
     ./internal/controller/components/modelcontroller/... \
-    ./internal/controller/datasciencecluster/... \
-    2>&1 | tee /logs/verifier/stage2_feature.txt
-if [ ${PIPESTATUS[0]} -ne 0 ]; then
-    echo "Stage 2 FAILED: new tests missing or failing"
+    ./internal/controller/datasciencecluster/... 2>&1)
+STAGE2_EXIT=$?
+echo "$STAGE2_OUTPUT" | tee /logs/verifier/stage2_feature.txt
+if [ $STAGE2_EXIT -ne 0 ]; then
+    echo "Stage 2 FAILED: new tests failing"
+    REWARD=0
+elif echo "$STAGE2_OUTPUT" | grep -q "no tests to run"; then
+    echo "Stage 2 FAILED: new test functions not found"
     REWARD=0
 fi
 

@@ -2,7 +2,8 @@ FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
 
 RUN microdnf install -y git make gcc gcc-c++ tar gzip && microdnf clean all
 
-RUN curl -fsSL https://go.dev/dl/go1.26.3.linux-amd64.tar.gz | tar -C /usr/local -xz
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/') && \
+    curl -fsSL https://go.dev/dl/go1.26.3.linux-${ARCH}.tar.gz | tar -C /usr/local -xz
 ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
 
 WORKDIR /app

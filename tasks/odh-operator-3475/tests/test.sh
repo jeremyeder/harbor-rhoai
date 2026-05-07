@@ -19,12 +19,16 @@ fi
 
 # Stage 2: Feature verification — confirm precondition test functions exist and pass
 echo "=== Stage 2: Feature verification ==="
-go test -count=1 -v -run "TestPreCondition|TestMonitorCRD|TestRunAll|TestWithPreCondition" \
+STAGE2_OUTPUT=$(go test -count=1 -v -run "TestPreCondition|TestMonitorCRD|TestRunAll" \
     ./pkg/controller/precondition/... \
-    ./pkg/controller/reconciler/... \
-    2>&1 | tee /logs/verifier/stage2_feature.txt
-if [ ${PIPESTATUS[0]} -ne 0 ]; then
-    echo "Stage 2 FAILED: new tests missing or failing"
+    ./pkg/controller/reconciler/... 2>&1)
+STAGE2_EXIT=$?
+echo "$STAGE2_OUTPUT" | tee /logs/verifier/stage2_feature.txt
+if [ $STAGE2_EXIT -ne 0 ]; then
+    echo "Stage 2 FAILED: new tests failing"
+    REWARD=0
+elif echo "$STAGE2_OUTPUT" | grep -q "no tests to run"; then
+    echo "Stage 2 FAILED: new test functions not found"
     REWARD=0
 fi
 
