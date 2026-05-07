@@ -1,0 +1,1853 @@
+diff --git a/.rules/review-instructions.md b/.rules/review-instructions.md
+index 4c12c89aaa08..451cd35dc2a2 100644
+--- a/.rules/review-instructions.md
++++ b/.rules/review-instructions.md
+@@ -1,26 +1,14 @@
+ # Review Instructions for AI Code Reviewers
+ 
+ These instructions are meta-guidance for AI code review tools (CodeRabbit, etc.).
+-They define reviewer behavior controls specific to this repository.
+-For detailed architectural rules, see `AGENTS.md` "Architecture Enforcement Rules" section.
+-
+-## Review Noise Reduction
+-
+-- Restrict feedback to errors, security risks, and functionality-breaking problems.
+-- DO NOT post comments on code style, formatting, or non-critical improvements.
+-- Limit review comments to 5 items maximum per file, unless additional blockers exist.
+-- Group similar issues into a single comment instead of posting multiple notes.
+-- If a pattern repeats across files, mention it once at summary level only.
+-- DO NOT suggest refactoring unless it fixes a bug or security issue.
+-- If there are no critical problems, respond with minimal approval. DO NOT add filler commentary.
+-- Avoid line-by-line commentary unless it highlights a critical bug, security hole, or RBAC gap.
++They define review priorities and anti-patterns specific to this repository.
+ 
+ ## Review Priority Order
+ 
+ When multiple findings exist, prioritize in this order:
+ 
+-1. Security vulnerabilities (provide CWE ID and severity; include CVE ID if referencing a known vulnerability; describe exploit scenario and remediation code)
+-2. RBAC permission gaps — see AGENTS.md "RBAC and Controller Tracing" for the tracing procedure
++1. Security vulnerabilities (provide CWE/CVE IDs, severity, exploit scenario, and remediation code)
++2. RBAC permission gaps — trace `client.Client` calls to the calling controller's `kubebuilder_rbac.go`
+ 3. Architectural issues and anti-patterns
+ 4. Bug-prone patterns and error handling gaps
+ 5. Performance problems
+@@ -29,9 +17,9 @@ When multiple findings exist, prioritize in this order:
+ 
+ DO NOT suggest the following — these are common false positives in this codebase:
+ 
+-- **Tautological test oracles**: DO NOT suggest that e2e tests call the same production helper or API resource they are validating. See AGENTS.md "Test Oracle Independence" for rationale.
+-- **Removing fallback logic**: DO NOT flag OpenShift-to-vanilla-K8s fallback paths as dead code or suggest simplifying the three-way error branch. See AGENTS.md "Multi-Platform Fallback Patterns" for rationale.
+-- **Missing `kubebuilder_rbac.go` in component controllers**: Component controllers use codegen for RBAC — see AGENTS.md "RBAC and Controller Tracing" for which controllers have hand-maintained files.
++- **Tautological test oracles**: DO NOT suggest that e2e tests call the same production helper or API resource they are validating. Independent oracles are intentional. See `AGENTS.md` "Test Oracle Independence" section.
++- **Removing fallback logic**: DO NOT flag OpenShift-to-vanilla-K8s fallback paths as dead code or suggest simplifying the three-way error branch (`success / IsNotFound|IsNoMatchError / other error`). The fallback is the primary path on non-OpenShift clusters.
++- **Missing `kubebuilder_rbac.go` in component controllers**: Component controllers under `internal/controller/components/` use codegen for RBAC. Only top-level controllers (`dscinitialization`, `datasciencecluster`, `gateway`, `cloudmanager/*`) have hand-maintained `kubebuilder_rbac.go` files.
+ - **Suggesting `OwnerReferences` be set manually**: The reconciler builder pattern handles OwnerReferences. DO NOT suggest adding them in action code unless there is a cross-namespace ownership scenario.
+ - **PR description format comments**: The PR template already enforces description requirements. DO NOT comment on PR description format unless it is completely empty.
+ 
+@@ -39,9 +27,9 @@ DO NOT suggest the following — these are common false positives in this codeba
+ 
+ Always flag these regardless of context:
+ 
+-- New or modified `+kubebuilder:rbac` markers inconsistent with `client.Client` operations in the PR (note: `config/rbac/role.yaml` is gitignored; regeneration is validated by CI)
+-- New `client.Client` operations in `pkg/` without RBAC coverage in all calling controllers (see AGENTS.md "RBAC and Controller Tracing")
+-- Status conditions that don't update during deletion or error transitions (see AGENTS.md "Status Conditions and Lifecycle Transitions")
++- Any `+kubebuilder:rbac` change without a corresponding `make manifests` regeneration
++- New `client.Client` operations in `pkg/` without RBAC coverage in all calling controllers
++- Status conditions that don't update during deletion or error transitions
+ - `InsecureSkipVerify: true` in non-test code
+-- Newly introduced wildcard verbs or resources in RBAC rules
++- Wildcard verbs or resources in RBAC rules
+ - Secrets, tokens, or credentials logged at any verbosity level
+diff --git a/AGENTS.md b/AGENTS.md
+index 9ab34c924316..ab20a8c7e8cd 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -240,17 +240,16 @@ IsEnabled(dsc *dscv2.DataScienceCluster) bool
+ These documents contain critical requirements that MUST be followed.
+ Failure to read and follow these guidelines will result in code that does not meet project standards.
+ 
+-## Architecture Enforcement Rules
++## Review Guidance (for AI Code Reviewers)
+ 
+-The following rules encode repo-specific architectural patterns. They are used by AI code reviewers
+-(CodeRabbit, etc.) and AI coding assistants (Claude Code, Cursor, Gemini CLI) alike.
+-For reviewer-specific behavior controls (comment limits, priority ordering), see `.rules/review-instructions.md`.
++The following rules are imperative instructions for AI-powered code reviewers (CodeRabbit, etc.).
++They complement the org-wide security review configuration and encode repo-specific patterns.
+ 
+ ### RBAC and Controller Tracing
+ 
+ - When reviewing changes to `pkg/` that add new `client.Client` operations (`Get`, `List`, `Create`, `Update`, `Delete`, `Patch`), **trace every calling controller** and verify its `kubebuilder_rbac.go` has a matching `+kubebuilder:rbac` marker for the new resource.
+ - RBAC markers live in `kubebuilder_rbac.go` files **only for top-level controllers**: `dscinitialization`, `datasciencecluster`, `gateway`, and `cloudmanager/*`. Component controllers under `internal/controller/components/` use codegen — **DO NOT flag the absence of `kubebuilder_rbac.go` in component controller directories**.
+-- When a PR modifies `+kubebuilder:rbac` markers, verify that the markers are consistent with the `client.Client` operations in the change. Note: `config/rbac/role.yaml` is gitignored — regeneration is validated by CI (`test-required-files-updated`), not by PR diff.
++- When a PR modifies `+kubebuilder:rbac` markers, verify that `config/rbac/role.yaml` was regenerated (`make manifests`). If the generated diff is not included or mentioned, flag it.
+ - **DO NOT** suggest adding RBAC markers to `pkg/` helper files. Markers belong on the controller that calls the helper, not the helper itself.
+ 
+ ### Test Oracle Independence
+diff --git a/cmd/component-codegen/templates/component_handler.go.tmpl b/cmd/component-codegen/templates/component_handler.go.tmpl
+index edb7769330bc..6276c338b74e 100644
+--- a/cmd/component-codegen/templates/component_handler.go.tmpl
++++ b/cmd/component-codegen/templates/component_handler.go.tmpl
+@@ -80,6 +80,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason("Deleting"),
++			conditions.WithMessage("Component CR is being deleted"),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	switch s.GetManagementState(dsc) {
+ 	case operatorv1.Managed:
+ 		dsc.Status.Components.{{ .Component }}.{{ .Component }}CommonStatus = c.Status.{{ .Component }}CommonStatus.DeepCopy()
+diff --git a/internal/controller/components/dashboard/dashboard.go b/internal/controller/components/dashboard/dashboard.go
+index e712f1b79dfe..ef77ed8af031 100644
+--- a/internal/controller/components/dashboard/dashboard.go
++++ b/internal/controller/components/dashboard/dashboard.go
+@@ -97,6 +97,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.Dashboard.DashboardCommonStatus = c.Status.DashboardCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/dashboard/dashboard_test.go b/internal/controller/components/dashboard/dashboard_test.go
+index dec641b7d7cc..730d16bc56d3 100644
+--- a/internal/controller/components/dashboard/dashboard_test.go
++++ b/internal/controller/components/dashboard/dashboard_test.go
+@@ -188,6 +188,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithDashboard(operatorv1.Managed)
++		dashboard := createDashboardCR(true)
++		now := metav1.Now()
++		dashboard.SetDeletionTimestamp(&now)
++		dashboard.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, dashboard))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &odhtypes.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/datasciencepipelines/datasciencepipelines.go b/internal/controller/components/datasciencepipelines/datasciencepipelines.go
+index 6ffb1fefa93e..9922181b31f5 100644
+--- a/internal/controller/components/datasciencepipelines/datasciencepipelines.go
++++ b/internal/controller/components/datasciencepipelines/datasciencepipelines.go
+@@ -89,6 +89,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.AIPipelines.DataSciencePipelinesCommonStatus = c.Status.DataSciencePipelinesCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/datasciencepipelines/datasciencepipelines_test.go b/internal/controller/components/datasciencepipelines/datasciencepipelines_test.go
+index 39789f4bca0e..67556a0a4c34 100644
+--- a/internal/controller/components/datasciencepipelines/datasciencepipelines_test.go
++++ b/internal/controller/components/datasciencepipelines/datasciencepipelines_test.go
+@@ -147,6 +147,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithDataSciencePipelines(operatorv1.Managed)
++		datasciencepipelines := createDataSciencePipelinesCR(true)
++		now := metav1.Now()
++		datasciencepipelines.SetDeletionTimestamp(&now)
++		datasciencepipelines.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, datasciencepipelines))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/feastoperator/feastoperator.go b/internal/controller/components/feastoperator/feastoperator.go
+index 9502d2eee52b..3a833b3d3513 100644
+--- a/internal/controller/components/feastoperator/feastoperator.go
++++ b/internal/controller/components/feastoperator/feastoperator.go
+@@ -81,6 +81,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.FeastOperator.FeastOperatorCommonStatus = c.Status.FeastOperatorCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/feastoperator/feastoperator_test.go b/internal/controller/components/feastoperator/feastoperator_test.go
+index 72961d427ed1..92ec47d7b235 100644
+--- a/internal/controller/components/feastoperator/feastoperator_test.go
++++ b/internal/controller/components/feastoperator/feastoperator_test.go
+@@ -147,6 +147,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithFeastOperator(operatorv1.Managed)
++		feastoperator := createFeastOperatorCR(true)
++		now := metav1.Now()
++		feastoperator.SetDeletionTimestamp(&now)
++		feastoperator.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, feastoperator))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/kserve/kserve.go b/internal/controller/components/kserve/kserve.go
+index d3458e55b4e2..d08be5fa84cf 100644
+--- a/internal/controller/components/kserve/kserve.go
++++ b/internal/controller/components/kserve/kserve.go
+@@ -117,6 +117,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.Kserve.KserveCommonStatus = c.Status.KserveCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/kserve/kserve_test.go b/internal/controller/components/kserve/kserve_test.go
+index 805d140d41ef..1cb81d367919 100644
+--- a/internal/controller/components/kserve/kserve_test.go
++++ b/internal/controller/components/kserve/kserve_test.go
+@@ -148,6 +148,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithKserve(operatorv1.Managed)
++		kserve := createKserveCR(true)
++		now := metav1.Now()
++		kserve.SetDeletionTimestamp(&now)
++		kserve.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, kserve))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/kueue/kueue.go b/internal/controller/components/kueue/kueue.go
+index 4ab5dd00d824..e924318bb192 100644
+--- a/internal/controller/components/kueue/kueue.go
++++ b/internal/controller/components/kueue/kueue.go
+@@ -96,6 +96,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.Kueue.KueueCommonStatus = c.Status.KueueCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/kueue/kueue_test.go b/internal/controller/components/kueue/kueue_test.go
+index 9e7f9a98c448..0c78c6e06cef 100644
+--- a/internal/controller/components/kueue/kueue_test.go
++++ b/internal/controller/components/kueue/kueue_test.go
+@@ -174,6 +174,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithKueue(operatorv1.Managed)
++		kueue := createKueueComponentCR(true)
++		now := metav1.Now()
++		kueue.SetDeletionTimestamp(&now)
++		kueue.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, kueue))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/llamastackoperator/llamastackoperator.go b/internal/controller/components/llamastackoperator/llamastackoperator.go
+index 3ffdde96a3da..40e5d148f0b6 100644
+--- a/internal/controller/components/llamastackoperator/llamastackoperator.go
++++ b/internal/controller/components/llamastackoperator/llamastackoperator.go
+@@ -81,6 +81,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.LlamaStackOperator.LlamaStackOperatorCommonStatus = c.Status.LlamaStackOperatorCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/llamastackoperator/llamastackoperator_test.go b/internal/controller/components/llamastackoperator/llamastackoperator_test.go
+new file mode 100644
+index 000000000000..b8b4161ed3c9
+--- /dev/null
++++ b/internal/controller/components/llamastackoperator/llamastackoperator_test.go
+@@ -0,0 +1,176 @@
++//nolint:testpackage
++package llamastackoperator
++
++import (
++	"encoding/json"
++	"testing"
++
++	operatorv1 "github.com/openshift/api/operator/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
++	componentApi "github.com/opendatahub-io/opendatahub-operator/v2/api/components/v1alpha1"
++	dscv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v2"
++	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/fakeclient"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/matchers/jq"
++
++	. "github.com/onsi/gomega"
++)
++
++func TestGetName(t *testing.T) {
++	g := NewWithT(t)
++	handler := &componentHandler{}
++
++	name := handler.GetName()
++	g.Expect(name).Should(Equal(componentApi.LlamaStackOperatorComponentName))
++}
++
++func TestIsEnabled(t *testing.T) {
++	g := NewWithT(t)
++	handler := &componentHandler{}
++
++	testCases := []struct {
++		name          string
++		state         operatorv1.ManagementState
++		shouldEnabled bool
++	}{
++		{"should be enabled when managed", operatorv1.Managed, true},
++		{"should be disabled when removed", operatorv1.Removed, false},
++		{"should be disabled when unmanaged", operatorv1.Unmanaged, false},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			dsc := createDSCWithLlamaStackOperator(tc.state)
++			if tc.shouldEnabled {
++				g.Expect(handler.IsEnabled(dsc)).Should(BeTrue())
++			} else {
++				g.Expect(handler.IsEnabled(dsc)).Should(BeFalse())
++			}
++		})
++	}
++}
++
++func TestUpdateDSCStatus(t *testing.T) {
++	handler := &componentHandler{}
++
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithLlamaStackOperator(operatorv1.Managed)
++		cr := createLlamaStackOperatorCR(true)
++		now := metav1.Now()
++		cr.SetDeletionTimestamp(&now)
++		cr.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, cr))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
++	t.Run("should handle enabled component with ready LlamaStackOperator CR", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithLlamaStackOperator(operatorv1.Managed)
++		cr := createLlamaStackOperatorCR(true)
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, cr))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionTrue))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.components.llamastackoperator.managementState == "%s"`, operatorv1.Managed),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionTrue),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.ReadyReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "Component is ready"`, ReadyConditionType),
++		)))
++	})
++
++	t.Run("should handle disabled component", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithLlamaStackOperator(operatorv1.Removed)
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionUnknown))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.components.llamastackoperator.managementState == "%s"`, operatorv1.Removed),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, operatorv1.Removed),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .severity == "%s"`, ReadyConditionType, common.ConditionSeverityInfo),
++		)))
++	})
++}
++
++func createDSCWithLlamaStackOperator(managementState operatorv1.ManagementState) *dscv2.DataScienceCluster {
++	dsc := dscv2.DataScienceCluster{}
++	dsc.SetGroupVersionKind(gvk.DataScienceCluster)
++	dsc.SetName("test-dsc")
++
++	dsc.Spec.Components.LlamaStackOperator.ManagementState = managementState
++
++	return &dsc
++}
++
++func createLlamaStackOperatorCR(ready bool) *componentApi.LlamaStackOperator {
++	c := componentApi.LlamaStackOperator{}
++	c.SetGroupVersionKind(gvk.LlamaStackOperator)
++	c.SetName(componentApi.LlamaStackOperatorInstanceName)
++
++	if ready {
++		c.Status.Conditions = []common.Condition{{
++			Type:    status.ConditionTypeReady,
++			Status:  metav1.ConditionTrue,
++			Reason:  status.ReadyReason,
++			Message: "Component is ready",
++		}}
++	} else {
++		c.Status.Conditions = []common.Condition{{
++			Type:    status.ConditionTypeReady,
++			Status:  metav1.ConditionFalse,
++			Reason:  status.NotReadyReason,
++			Message: "Component is not ready",
++		}}
++	}
++
++	return &c
++}
+diff --git a/internal/controller/components/mlflowoperator/mlflowoperator.go b/internal/controller/components/mlflowoperator/mlflowoperator.go
+index 37e63716a2b1..9d1420b4dc46 100644
+--- a/internal/controller/components/mlflowoperator/mlflowoperator.go
++++ b/internal/controller/components/mlflowoperator/mlflowoperator.go
+@@ -81,6 +81,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.MLflowOperator.MLflowOperatorCommonStatus = c.Status.MLflowOperatorCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/mlflowoperator/mlflowoperator_test.go b/internal/controller/components/mlflowoperator/mlflowoperator_test.go
+new file mode 100644
+index 000000000000..070705e9091e
+--- /dev/null
++++ b/internal/controller/components/mlflowoperator/mlflowoperator_test.go
+@@ -0,0 +1,176 @@
++//nolint:testpackage
++package mlflowoperator
++
++import (
++	"encoding/json"
++	"testing"
++
++	operatorv1 "github.com/openshift/api/operator/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
++	componentApi "github.com/opendatahub-io/opendatahub-operator/v2/api/components/v1alpha1"
++	dscv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v2"
++	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/fakeclient"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/matchers/jq"
++
++	. "github.com/onsi/gomega"
++)
++
++func TestGetName(t *testing.T) {
++	g := NewWithT(t)
++	handler := &componentHandler{}
++
++	name := handler.GetName()
++	g.Expect(name).Should(Equal(componentApi.MLflowOperatorComponentName))
++}
++
++func TestIsEnabled(t *testing.T) {
++	g := NewWithT(t)
++	handler := &componentHandler{}
++
++	testCases := []struct {
++		name          string
++		state         operatorv1.ManagementState
++		shouldEnabled bool
++	}{
++		{"should be enabled when managed", operatorv1.Managed, true},
++		{"should be disabled when removed", operatorv1.Removed, false},
++		{"should be disabled when unmanaged", operatorv1.Unmanaged, false},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			dsc := createDSCWithMLflowOperator(tc.state)
++			if tc.shouldEnabled {
++				g.Expect(handler.IsEnabled(dsc)).Should(BeTrue())
++			} else {
++				g.Expect(handler.IsEnabled(dsc)).Should(BeFalse())
++			}
++		})
++	}
++}
++
++func TestUpdateDSCStatus(t *testing.T) {
++	handler := &componentHandler{}
++
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithMLflowOperator(operatorv1.Managed)
++		cr := createMLflowOperatorCR(true)
++		now := metav1.Now()
++		cr.SetDeletionTimestamp(&now)
++		cr.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, cr))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
++	t.Run("should handle enabled component with ready MLflowOperator CR", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithMLflowOperator(operatorv1.Managed)
++		cr := createMLflowOperatorCR(true)
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, cr))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionTrue))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.components.mlflowoperator.managementState == "%s"`, operatorv1.Managed),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionTrue),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.ReadyReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "Component is ready"`, ReadyConditionType),
++		)))
++	})
++
++	t.Run("should handle disabled component", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithMLflowOperator(operatorv1.Removed)
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionUnknown))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.components.mlflowoperator.managementState == "%s"`, operatorv1.Removed),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, operatorv1.Removed),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .severity == "%s"`, ReadyConditionType, common.ConditionSeverityInfo),
++		)))
++	})
++}
++
++func createDSCWithMLflowOperator(managementState operatorv1.ManagementState) *dscv2.DataScienceCluster {
++	dsc := dscv2.DataScienceCluster{}
++	dsc.SetGroupVersionKind(gvk.DataScienceCluster)
++	dsc.SetName("test-dsc")
++
++	dsc.Spec.Components.MLflowOperator.ManagementState = managementState
++
++	return &dsc
++}
++
++func createMLflowOperatorCR(ready bool) *componentApi.MLflowOperator {
++	c := componentApi.MLflowOperator{}
++	c.SetGroupVersionKind(gvk.MLflowOperator)
++	c.SetName(componentApi.MLflowOperatorInstanceName)
++
++	if ready {
++		c.Status.Conditions = []common.Condition{{
++			Type:    status.ConditionTypeReady,
++			Status:  metav1.ConditionTrue,
++			Reason:  status.ReadyReason,
++			Message: "Component is ready",
++		}}
++	} else {
++		c.Status.Conditions = []common.Condition{{
++			Type:    status.ConditionTypeReady,
++			Status:  metav1.ConditionFalse,
++			Reason:  status.NotReadyReason,
++			Message: "Component is not ready",
++		}}
++	}
++
++	return &c
++}
+diff --git a/internal/controller/components/modelcontroller/modelcontroller.go b/internal/controller/components/modelcontroller/modelcontroller.go
+index 679fd7aa0139..78b2f176c9b1 100644
+--- a/internal/controller/components/modelcontroller/modelcontroller.go
++++ b/internal/controller/components/modelcontroller/modelcontroller.go
+@@ -100,6 +100,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		if rc := conditions.FindStatusCondition(c.GetStatus(), status.ConditionTypeReady); rc != nil {
+ 			rr.Conditions.MarkFrom(ReadyConditionType, *rc)
+diff --git a/internal/controller/components/modelcontroller/modelcontroller_test.go b/internal/controller/components/modelcontroller/modelcontroller_test.go
+index 333891a21d66..d69062f08900 100644
+--- a/internal/controller/components/modelcontroller/modelcontroller_test.go
++++ b/internal/controller/components/modelcontroller/modelcontroller_test.go
+@@ -197,6 +197,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithModelController(operatorv1.Managed, operatorv1.Removed)
++		mc := createModelControllerCR(true)
++		now := metav1.Now()
++		mc.SetDeletionTimestamp(&now)
++		mc.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, mc))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/modelregistry/modelregistry.go b/internal/controller/components/modelregistry/modelregistry.go
+index 2b70f8cdba57..1975628651c6 100644
+--- a/internal/controller/components/modelregistry/modelregistry.go
++++ b/internal/controller/components/modelregistry/modelregistry.go
+@@ -92,6 +92,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.ModelRegistry.ModelRegistryCommonStatus = c.Status.ModelRegistryCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/modelregistry/modelregistry_test.go b/internal/controller/components/modelregistry/modelregistry_test.go
+index 5e6be8203eca..e821b2308e2e 100644
+--- a/internal/controller/components/modelregistry/modelregistry_test.go
++++ b/internal/controller/components/modelregistry/modelregistry_test.go
+@@ -184,6 +184,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithModelRegistry(operatorv1.Managed)
++		modelregistry := createModelRegistryCR(true)
++		now := metav1.Now()
++		modelregistry.SetDeletionTimestamp(&now)
++		modelregistry.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, modelregistry))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/modelsasservice/modelsasservice.go b/internal/controller/components/modelsasservice/modelsasservice.go
+index d10e1aed3c40..19a4b27a0cd8 100644
+--- a/internal/controller/components/modelsasservice/modelsasservice.go
++++ b/internal/controller/components/modelsasservice/modelsasservice.go
+@@ -113,6 +113,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		if rc := conditions.FindStatusCondition(c.GetStatus(), status.ConditionTypeReady); rc != nil {
+ 			rr.Conditions.MarkFrom(ReadyConditionType, *rc)
+diff --git a/internal/controller/components/modelsasservice/modelsasservice_test.go b/internal/controller/components/modelsasservice/modelsasservice_test.go
+index 9b94c5590c4c..db6332b60656 100644
+--- a/internal/controller/components/modelsasservice/modelsasservice_test.go
++++ b/internal/controller/components/modelsasservice/modelsasservice_test.go
+@@ -13,7 +13,12 @@ import (
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
+ 	componentApi "github.com/opendatahub-io/opendatahub-operator/v2/api/components/v1alpha1"
+ 	dscv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v2"
++	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	pkgtypes "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/annotations"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/fakeclient"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/matchers/jq"
+ 
+ 	. "github.com/onsi/gomega"
+@@ -97,24 +102,121 @@ func TestIsEnabled(t *testing.T) {
+ 	}
+ }
+ 
++func TestUpdateDSCStatus(t *testing.T) {
++	handler := &componentHandler{}
++
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithKServeAndMaaS(operatorv1.Managed, operatorv1.Managed)
++		cr := createModelsAsServiceCR(true)
++		now := metav1.Now()
++		cr.SetDeletionTimestamp(&now)
++		cr.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, cr))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &pkgtypes.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
++	t.Run("should handle enabled component with ready ModelsAsService CR", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithKServeAndMaaS(operatorv1.Managed, operatorv1.Managed)
++		cr := createModelsAsServiceCR(true)
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, cr))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &pkgtypes.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionTrue))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionTrue),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.ReadyReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "Component is ready"`, ReadyConditionType),
++		)))
++	})
++
++	t.Run("should handle disabled component when KServe is not managed", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithKServeAndMaaS(operatorv1.Removed, operatorv1.Managed)
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &pkgtypes.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionUnknown))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, "KServeDisabled"),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .severity == "%s"`, ReadyConditionType, common.ConditionSeverityInfo),
++		)))
++	})
++}
++
+ func createDSCWithKServeAndMaaS(kserveState, maasState operatorv1.ManagementState) *dscv2.DataScienceCluster {
+-	return &dscv2.DataScienceCluster{
+-		ObjectMeta: metav1.ObjectMeta{
+-			Name: "test-dsc",
+-		},
+-		Spec: dscv2.DataScienceClusterSpec{
+-			Components: dscv2.Components{
+-				Kserve: componentApi.DSCKserve{
+-					ManagementSpec: common.ManagementSpec{
+-						ManagementState: kserveState,
+-					},
+-					KserveCommonSpec: componentApi.KserveCommonSpec{
+-						ModelsAsService: componentApi.DSCModelsAsServiceSpec{
+-							ManagementState: maasState,
+-						},
+-					},
+-				},
+-			},
+-		},
++	dsc := dscv2.DataScienceCluster{}
++	dsc.SetGroupVersionKind(gvk.DataScienceCluster)
++	dsc.SetName("test-dsc")
++
++	dsc.Spec.Components.Kserve.ManagementState = kserveState
++	dsc.Spec.Components.Kserve.ModelsAsService.ManagementState = maasState
++
++	return &dsc
++}
++
++func createModelsAsServiceCR(ready bool) *componentApi.ModelsAsService {
++	c := componentApi.ModelsAsService{}
++	c.SetGroupVersionKind(gvk.ModelsAsService)
++	c.SetName(componentApi.ModelsAsServiceInstanceName)
++
++	if ready {
++		c.Status.Conditions = []common.Condition{{
++			Type:    status.ConditionTypeReady,
++			Status:  metav1.ConditionTrue,
++			Reason:  status.ReadyReason,
++			Message: "Component is ready",
++		}}
++	} else {
++		c.Status.Conditions = []common.Condition{{
++			Type:    status.ConditionTypeReady,
++			Status:  metav1.ConditionFalse,
++			Reason:  status.NotReadyReason,
++			Message: "Component is not ready",
++		}}
+ 	}
++
++	return &c
+ }
+diff --git a/internal/controller/components/ray/ray.go b/internal/controller/components/ray/ray.go
+index f05c92d280c4..1816fdf4951d 100644
+--- a/internal/controller/components/ray/ray.go
++++ b/internal/controller/components/ray/ray.go
+@@ -81,6 +81,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.Ray.RayCommonStatus = c.Status.RayCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/ray/ray_test.go b/internal/controller/components/ray/ray_test.go
+index c5a08983d58b..7521fe4e6625 100644
+--- a/internal/controller/components/ray/ray_test.go
++++ b/internal/controller/components/ray/ray_test.go
+@@ -147,6 +147,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithRay(operatorv1.Managed)
++		ray := createRayCR(true)
++		now := metav1.Now()
++		ray.SetDeletionTimestamp(&now)
++		ray.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, ray))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/sparkoperator/sparkoperator.go b/internal/controller/components/sparkoperator/sparkoperator.go
+index 9472a959437f..6e475e02b4f5 100644
+--- a/internal/controller/components/sparkoperator/sparkoperator.go
++++ b/internal/controller/components/sparkoperator/sparkoperator.go
+@@ -79,6 +79,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.SparkOperator.SparkOperatorCommonStatus = c.Status.SparkOperatorCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/sparkoperator/sparkoperator_test.go b/internal/controller/components/sparkoperator/sparkoperator_test.go
+new file mode 100644
+index 000000000000..e2bec9722690
+--- /dev/null
++++ b/internal/controller/components/sparkoperator/sparkoperator_test.go
+@@ -0,0 +1,176 @@
++//nolint:testpackage
++package sparkoperator
++
++import (
++	"encoding/json"
++	"testing"
++
++	operatorv1 "github.com/openshift/api/operator/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
++	componentApi "github.com/opendatahub-io/opendatahub-operator/v2/api/components/v1alpha1"
++	dscv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v2"
++	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/fakeclient"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/matchers/jq"
++
++	. "github.com/onsi/gomega"
++)
++
++func TestGetName(t *testing.T) {
++	g := NewWithT(t)
++	handler := &componentHandler{}
++
++	name := handler.GetName()
++	g.Expect(name).Should(Equal(componentApi.SparkOperatorComponentName))
++}
++
++func TestIsEnabled(t *testing.T) {
++	g := NewWithT(t)
++	handler := &componentHandler{}
++
++	testCases := []struct {
++		name          string
++		state         operatorv1.ManagementState
++		shouldEnabled bool
++	}{
++		{"should be enabled when managed", operatorv1.Managed, true},
++		{"should be disabled when removed", operatorv1.Removed, false},
++		{"should be disabled when unmanaged", operatorv1.Unmanaged, false},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			dsc := createDSCWithSparkOperator(tc.state)
++			if tc.shouldEnabled {
++				g.Expect(handler.IsEnabled(dsc)).Should(BeTrue())
++			} else {
++				g.Expect(handler.IsEnabled(dsc)).Should(BeFalse())
++			}
++		})
++	}
++}
++
++func TestUpdateDSCStatus(t *testing.T) {
++	handler := &componentHandler{}
++
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithSparkOperator(operatorv1.Managed)
++		cr := createSparkOperatorCR(true)
++		now := metav1.Now()
++		cr.SetDeletionTimestamp(&now)
++		cr.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, cr))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
++	t.Run("should handle enabled component with ready SparkOperator CR", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithSparkOperator(operatorv1.Managed)
++		cr := createSparkOperatorCR(true)
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, cr))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionTrue))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.components.sparkoperator.managementState == "%s"`, operatorv1.Managed),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionTrue),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.ReadyReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "Component is ready"`, ReadyConditionType),
++		)))
++	})
++
++	t.Run("should handle disabled component", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithSparkOperator(operatorv1.Removed)
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionUnknown))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.components.sparkoperator.managementState == "%s"`, operatorv1.Removed),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, operatorv1.Removed),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .severity == "%s"`, ReadyConditionType, common.ConditionSeverityInfo),
++		)))
++	})
++}
++
++func createDSCWithSparkOperator(managementState operatorv1.ManagementState) *dscv2.DataScienceCluster {
++	dsc := dscv2.DataScienceCluster{}
++	dsc.SetGroupVersionKind(gvk.DataScienceCluster)
++	dsc.SetName("test-dsc")
++
++	dsc.Spec.Components.SparkOperator.ManagementState = managementState
++
++	return &dsc
++}
++
++func createSparkOperatorCR(ready bool) *componentApi.SparkOperator {
++	c := componentApi.SparkOperator{}
++	c.SetGroupVersionKind(gvk.SparkOperator)
++	c.SetName(componentApi.SparkOperatorInstanceName)
++
++	if ready {
++		c.Status.Conditions = []common.Condition{{
++			Type:    status.ConditionTypeReady,
++			Status:  metav1.ConditionTrue,
++			Reason:  status.ReadyReason,
++			Message: "Component is ready",
++		}}
++	} else {
++		c.Status.Conditions = []common.Condition{{
++			Type:    status.ConditionTypeReady,
++			Status:  metav1.ConditionFalse,
++			Reason:  status.NotReadyReason,
++			Message: "Component is not ready",
++		}}
++	}
++
++	return &c
++}
+diff --git a/internal/controller/components/trainer/trainer.go b/internal/controller/components/trainer/trainer.go
+index 9275f55b6962..858f00ca3be4 100644
+--- a/internal/controller/components/trainer/trainer.go
++++ b/internal/controller/components/trainer/trainer.go
+@@ -85,6 +85,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.Trainer.TrainerCommonStatus = c.Status.TrainerCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/trainer/trainer_test.go b/internal/controller/components/trainer/trainer_test.go
+index 2a14e424a338..54d70cd4e6a3 100644
+--- a/internal/controller/components/trainer/trainer_test.go
++++ b/internal/controller/components/trainer/trainer_test.go
+@@ -147,6 +147,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithTrainer(operatorv1.Managed)
++		trainer := createTrainerCR(true)
++		now := metav1.Now()
++		trainer.SetDeletionTimestamp(&now)
++		trainer.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, trainer))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/trainingoperator/trainingoperator.go b/internal/controller/components/trainingoperator/trainingoperator.go
+index ee2b010f0bab..0009895aa50b 100644
+--- a/internal/controller/components/trainingoperator/trainingoperator.go
++++ b/internal/controller/components/trainingoperator/trainingoperator.go
+@@ -81,6 +81,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.TrainingOperator.TrainingOperatorCommonStatus = c.Status.TrainingOperatorCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/trainingoperator/trainingoperator_test.go b/internal/controller/components/trainingoperator/trainingoperator_test.go
+index 52d8e01f0fdc..4dcd798b70c5 100644
+--- a/internal/controller/components/trainingoperator/trainingoperator_test.go
++++ b/internal/controller/components/trainingoperator/trainingoperator_test.go
+@@ -147,6 +147,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithTrainingOperator(operatorv1.Managed)
++		trainingoperator := createTrainingOperatorCR(true)
++		now := metav1.Now()
++		trainingoperator.SetDeletionTimestamp(&now)
++		trainingoperator.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, trainingoperator))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/trustyai/trustyai.go b/internal/controller/components/trustyai/trustyai.go
+index 3aa48cce304d..ad418522514c 100644
+--- a/internal/controller/components/trustyai/trustyai.go
++++ b/internal/controller/components/trustyai/trustyai.go
+@@ -103,6 +103,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.TrustyAI.TrustyAICommonStatus = c.Status.TrustyAICommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/trustyai/trustyai_test.go b/internal/controller/components/trustyai/trustyai_test.go
+index 9d92a1b19130..c967608bccfe 100644
+--- a/internal/controller/components/trustyai/trustyai_test.go
++++ b/internal/controller/components/trustyai/trustyai_test.go
+@@ -265,6 +265,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithTrustyAI(operatorv1.Managed)
++		trustyai := createTrustyAICR(true)
++		now := metav1.Now()
++		trustyai.SetDeletionTimestamp(&now)
++		trustyai.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, trustyai))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &odhtypes.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/components/workbenches/workbenches.go b/internal/controller/components/workbenches/workbenches.go
+index 45fc7703a9f9..2f447babdd14 100644
+--- a/internal/controller/components/workbenches/workbenches.go
++++ b/internal/controller/components/workbenches/workbenches.go
+@@ -138,6 +138,15 @@ func (s *componentHandler) UpdateDSCStatus(ctx context.Context, rr *types.Reconc
+ 
+ 	rr.Conditions.MarkFalse(ReadyConditionType)
+ 
++	if !c.GetDeletionTimestamp().IsZero() {
++		rr.Conditions.MarkFalse(
++			ReadyConditionType,
++			conditions.WithReason(status.DeletingReason),
++			conditions.WithMessage(status.DeletingMessage),
++		)
++		return metav1.ConditionFalse, nil
++	}
++
+ 	if s.IsEnabled(dsc) {
+ 		dsc.Status.Components.Workbenches.WorkbenchesCommonStatus = c.Status.WorkbenchesCommonStatus.DeepCopy()
+ 
+diff --git a/internal/controller/components/workbenches/workbenches_test.go b/internal/controller/components/workbenches/workbenches_test.go
+index dd5f6c3b3b2b..ab72975c23e3 100644
+--- a/internal/controller/components/workbenches/workbenches_test.go
++++ b/internal/controller/components/workbenches/workbenches_test.go
+@@ -147,6 +147,35 @@ func TestUpdateDSCStatus(t *testing.T) {
+ 		))
+ 	})
+ 
++	t.Run("should return ConditionFalse when component CR has deletionTimestamp", func(t *testing.T) {
++		g := NewWithT(t)
++		ctx := t.Context()
++
++		dsc := createDSCWithWorkbenches(operatorv1.Managed)
++		workbenches := createWorkbenchesCR(true)
++		now := metav1.Now()
++		workbenches.SetDeletionTimestamp(&now)
++		workbenches.SetFinalizers([]string{"test-finalizer"})
++
++		cli, err := fakeclient.New(fakeclient.WithObjects(dsc, workbenches))
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		cs, err := handler.UpdateDSCStatus(ctx, &types.ReconciliationRequest{
++			Client:     cli,
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, ReadyConditionType),
++		})
++
++		g.Expect(err).ShouldNot(HaveOccurred())
++		g.Expect(cs).Should(Equal(metav1.ConditionFalse))
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, ReadyConditionType, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, ReadyConditionType, status.DeletingReason),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message == "%s"`, ReadyConditionType, status.DeletingMessage),
++		)))
++	})
++
+ 	t.Run("should handle disabled component", func(t *testing.T) {
+ 		g := NewWithT(t)
+ 		ctx := t.Context()
+diff --git a/internal/controller/datasciencecluster/datasciencecluster_controller_support.go b/internal/controller/datasciencecluster/datasciencecluster_controller_support.go
+index c009fdcf23fa..de6bd20a829b 100644
+--- a/internal/controller/datasciencecluster/datasciencecluster_controller_support.go
++++ b/internal/controller/datasciencecluster/datasciencecluster_controller_support.go
+@@ -45,13 +45,16 @@ func computeComponentsStatus(
+ 			return err
+ 		}
+ 
+-		if !component.IsEnabled(instance) {
++		enabled := component.IsEnabled(instance)
++		if !enabled && cs != metav1.ConditionFalse {
+ 			return nil
+ 		}
+ 
+-		managedComponent++
++		if enabled {
++			managedComponent++
++		}
+ 
+-		if cs == metav1.ConditionFalse {
++		if cs != metav1.ConditionTrue {
+ 			notReadyComponents = append(notReadyComponents, component.GetName())
+ 		}
+ 
+diff --git a/internal/controller/datasciencecluster/datasciencecluster_controller_support_test.go b/internal/controller/datasciencecluster/datasciencecluster_controller_support_test.go
+new file mode 100644
+index 000000000000..78ac7c147888
+--- /dev/null
++++ b/internal/controller/datasciencecluster/datasciencecluster_controller_support_test.go
+@@ -0,0 +1,200 @@
++//nolint:testpackage
++package datasciencecluster
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	ctrl "sigs.k8s.io/controller-runtime"
++	"sigs.k8s.io/controller-runtime/pkg/client"
++
++	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
++	dscv2 "github.com/opendatahub-io/opendatahub-operator/v2/api/datasciencecluster/v2"
++	cr "github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/components/registry"
++	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/matchers/jq"
++
++	. "github.com/onsi/gomega"
++)
++
++// mockHandler is a minimal ComponentHandler for testing computeComponentsStatus.
++type mockHandler struct {
++	name    string
++	enabled bool
++	status  metav1.ConditionStatus
++	err     error
++}
++
++func (m *mockHandler) Init(_ common.Platform) error { return nil }
++func (m *mockHandler) GetName() string              { return m.name }
++func (m *mockHandler) NewCRObject(_ context.Context, _ client.Client, _ *dscv2.DataScienceCluster) (common.PlatformObject, error) {
++	return nil, nil
++}
++func (m *mockHandler) NewComponentReconciler(_ context.Context, _ ctrl.Manager) error {
++	return nil
++}
++func (m *mockHandler) IsEnabled(_ *dscv2.DataScienceCluster) bool { return m.enabled }
++func (m *mockHandler) UpdateDSCStatus(_ context.Context, _ *types.ReconciliationRequest) (metav1.ConditionStatus, error) {
++	return m.status, m.err
++}
++
++func newRegistry(handlers ...cr.ComponentHandler) *cr.Registry {
++	reg := &cr.Registry{}
++	for _, h := range handlers {
++		reg.Add(h)
++	}
++	return reg
++}
++
++func newDSC() *dscv2.DataScienceCluster {
++	dsc := &dscv2.DataScienceCluster{}
++	dsc.SetGroupVersionKind(gvk.DataScienceCluster)
++	dsc.SetName("test-dsc")
++	return dsc
++}
++
++func TestComputeComponentsStatus(t *testing.T) {
++	t.Run("all managed components ready should set ComponentsReady=True", func(t *testing.T) {
++		g := NewWithT(t)
++		dsc := newDSC()
++		reg := newRegistry(
++			&mockHandler{name: "comp-a", enabled: true, status: metav1.ConditionTrue},
++			&mockHandler{name: "comp-b", enabled: true, status: metav1.ConditionTrue},
++		)
++
++		rr := &types.ReconciliationRequest{
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, status.ConditionTypeComponentsReady),
++		}
++
++		err := computeComponentsStatus(t.Context(), rr, reg)
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal,
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
++				status.ConditionTypeComponentsReady, metav1.ConditionTrue),
++		))
++	})
++
++	t.Run("ConditionUnknown from enabled component should set ComponentsReady=False", func(t *testing.T) {
++		g := NewWithT(t)
++		dsc := newDSC()
++		reg := newRegistry(
++			&mockHandler{name: "comp-a", enabled: true, status: metav1.ConditionTrue},
++			&mockHandler{name: "comp-b", enabled: true, status: metav1.ConditionUnknown},
++		)
++
++		rr := &types.ReconciliationRequest{
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, status.ConditionTypeComponentsReady),
++		}
++
++		err := computeComponentsStatus(t.Context(), rr, reg)
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
++				status.ConditionTypeComponentsReady, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message | contains("comp-b")`,
++				status.ConditionTypeComponentsReady),
++		)))
++	})
++
++	t.Run("ConditionFalse from enabled component should set ComponentsReady=False", func(t *testing.T) {
++		g := NewWithT(t)
++		dsc := newDSC()
++		reg := newRegistry(
++			&mockHandler{name: "comp-a", enabled: true, status: metav1.ConditionTrue},
++			&mockHandler{name: "comp-b", enabled: true, status: metav1.ConditionFalse},
++		)
++
++		rr := &types.ReconciliationRequest{
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, status.ConditionTypeComponentsReady),
++		}
++
++		err := computeComponentsStatus(t.Context(), rr, reg)
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
++				status.ConditionTypeComponentsReady, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message | contains("comp-b")`,
++				status.ConditionTypeComponentsReady),
++		)))
++	})
++
++	t.Run("disabled component returning ConditionFalse should count as not ready", func(t *testing.T) {
++		g := NewWithT(t)
++		dsc := newDSC()
++		reg := newRegistry(
++			&mockHandler{name: "comp-a", enabled: true, status: metav1.ConditionTrue},
++			&mockHandler{name: "comp-stuck", enabled: false, status: metav1.ConditionFalse},
++		)
++
++		rr := &types.ReconciliationRequest{
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, status.ConditionTypeComponentsReady),
++		}
++
++		err := computeComponentsStatus(t.Context(), rr, reg)
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
++				status.ConditionTypeComponentsReady, metav1.ConditionFalse),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .message | contains("comp-stuck")`,
++				status.ConditionTypeComponentsReady),
++		)))
++	})
++
++	t.Run("disabled component returning ConditionUnknown should be skipped", func(t *testing.T) {
++		g := NewWithT(t)
++		dsc := newDSC()
++		reg := newRegistry(
++			&mockHandler{name: "comp-a", enabled: true, status: metav1.ConditionTrue},
++			&mockHandler{name: "comp-disabled", enabled: false, status: metav1.ConditionUnknown},
++		)
++
++		rr := &types.ReconciliationRequest{
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, status.ConditionTypeComponentsReady),
++		}
++
++		err := computeComponentsStatus(t.Context(), rr, reg)
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal,
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
++				status.ConditionTypeComponentsReady, metav1.ConditionTrue),
++		))
++	})
++
++	t.Run("no managed components should set ComponentsReady=True with info severity", func(t *testing.T) {
++		g := NewWithT(t)
++		dsc := newDSC()
++		reg := newRegistry(
++			&mockHandler{name: "comp-a", enabled: false, status: metav1.ConditionUnknown},
++		)
++
++		rr := &types.ReconciliationRequest{
++			Instance:   dsc,
++			Conditions: conditions.NewManager(dsc, status.ConditionTypeComponentsReady),
++		}
++
++		err := computeComponentsStatus(t.Context(), rr, reg)
++		g.Expect(err).ShouldNot(HaveOccurred())
++
++		g.Expect(dsc).Should(WithTransform(json.Marshal, And(
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`,
++				status.ConditionTypeComponentsReady, metav1.ConditionTrue),
++			jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`,
++				status.ConditionTypeComponentsReady, status.NoManagedComponentsReason),
++		)))
++	})
++}
+diff --git a/internal/controller/status/status.go b/internal/controller/status/status.go
+index 13680af4de8b..64f880d75866 100644
+--- a/internal/controller/status/status.go
++++ b/internal/controller/status/status.go
+@@ -107,6 +107,8 @@ const (
+ 	AvailableReason = "Available"
+ 	NotReadyReason  = "NotReady"
+ 	ReadyReason     = "Ready"
++	DeletingReason  = "Deleting"
++	DeletingMessage = "Component CR is being deleted"
+ )
+ 
+ const (

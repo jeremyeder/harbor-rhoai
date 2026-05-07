@@ -1,0 +1,1721 @@
+diff --git a/internal/controller/cloudmanager/azure/azurekubernetesengine_controller.go b/internal/controller/cloudmanager/azure/azurekubernetesengine_controller.go
+index 092755ec48b7..7575f13484bd 100644
+--- a/internal/controller/cloudmanager/azure/azurekubernetesengine_controller.go
++++ b/internal/controller/cloudmanager/azure/azurekubernetesengine_controller.go
+@@ -17,8 +17,11 @@ import (
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/operatorconfig"
+ )
+ 
++// NewReconciler sets up the AzureKubernetesEngine controller and registers it with the manager.
+ func NewReconciler(ctx context.Context, mgr ctrl.Manager, cfg *operatorconfig.CloudManagerConfig) error {
+ 	resourceID := labels.NormalizePartOfValue(ccmv1alpha1.AzureKubernetesEngineKind)
++	bootstrapConfig := certmanager.DefaultBootstrapConfig(certmanager.WithOperatorCert(cfg.RhaiOperatorNamespace))
++
+ 	_, err := reconciler.ReconcilerFor(mgr, &ccmv1alpha1.AzureKubernetesEngine{}).
+ 		WithDynamicOwnership().
+ 		Watches(
+@@ -29,14 +32,14 @@ func NewReconciler(ctx context.Context, mgr ctrl.Manager, cfg *operatorconfig.Cl
+ 		WithAction(initialize).
+ 		ComposeWith(certmanager.Bootstrap[*ccmv1alpha1.AzureKubernetesEngine](
+ 			ccmv1alpha1.AzureKubernetesEngineInstanceName,
+-			certmanager.DefaultBootstrapConfig(certmanager.WithOperatorCert(cfg.RhaiOperatorNamespace)),
++			bootstrapConfig,
+ 		)).
+ 		WithActionE(cloudmanager.NewReconcileAction(resourceID)).
++		// GC must be last: evaluates every CCM resource and removes stale or orphaned ones.
++		WithActionE(cloudmanager.NewGCAction(resourceID, cfg.RhaiOperatorNamespace,
++			cloudmanager.BootstrapProtectedObjects(bootstrapConfig),
++		)).
+ 		WithConditions(cloudmanager.ConditionsTypes...).
+ 		Build(ctx)
+-	if err != nil {
+-		return err
+-	}
+-
+-	return nil
++	return err
+ }
+diff --git a/internal/controller/cloudmanager/azure/azurekubernetesengine_controller_test.go b/internal/controller/cloudmanager/azure/azurekubernetesengine_controller_test.go
+index c20958af0ada..3a2cce096268 100644
+--- a/internal/controller/cloudmanager/azure/azurekubernetesengine_controller_test.go
++++ b/internal/controller/cloudmanager/azure/azurekubernetesengine_controller_test.go
+@@ -3,11 +3,14 @@ package azure_test
+ import (
+ 	"context"
+ 	"io"
++	"strconv"
+ 	"testing"
++	"time"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+@@ -17,14 +20,42 @@ import (
+ 	ccmcommon "github.com/opendatahub-io/opendatahub-operator/v2/api/cloudmanager/common"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/cloudmanager/azure"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/annotations"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/labels"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/resources"
+ 	ccmtest "github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/cloudmanager"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/envt"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/matchers/jq"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/testf"
+ 
+ 	. "github.com/onsi/gomega"
+ )
+ 
++const nsCertManagerOperator = "cert-manager-operator"
++
++// listCertManagerDeployments returns the Deployments with the InfrastructurePartOf
++// label in the cert-manager operator namespace.
++func listCertManagerDeployments(wt *testf.WithT) ([]unstructured.Unstructured, error) {
++	list := &unstructured.UnstructuredList{}
++	list.SetGroupVersionKind(gvk.Deployment.GroupVersion().WithKind(gvk.Deployment.Kind + "List"))
++
++	if err := wt.Client().List(wt.Context(), list,
++		client.InNamespace(nsCertManagerOperator),
++		client.MatchingLabels{
++			labels.InfrastructurePartOf: labels.NormalizePartOfValue(ccmv1alpha1.AzureKubernetesEngineKind),
++		},
++	); err != nil {
++		return nil, err
++	}
++
++	return list.Items, nil
++}
++
++func hasCertManagerDeployments(wt *testf.WithT) bool {
++	items, err := listCertManagerDeployments(wt)
++	return err == nil && len(items) > 0
++}
++
+ var azureCfg = ccmtest.ControllerTestConfig{
+ 	CRDSubdir:     "azure",
+ 	NewReconciler: azure.NewReconciler,
+@@ -46,6 +77,19 @@ var azureCfg = ccmtest.ControllerTestConfig{
+ func TestAzureKubernetesEngine(t *testing.T) {
+ 	ccmtest.RequireCharts(t)
+ 
++	t.Run("namespaces do not have owner references", func(t *testing.T) {
++		wt := tc.NewWithT(t)
++
++		ccmtest.CreateCR(t, wt, azureCfg, ccmcommon.Dependencies{
++			CertManager: ccmcommon.CertManagerDependency{ManagementPolicy: ccmcommon.Managed},
++		})
++
++		wt.Get(gvk.Namespace, types.NamespacedName{Name: nsCertManagerOperator}).
++			Eventually().Should(
++			jq.Match(`.metadata.ownerReferences == null or (.metadata.ownerReferences | length == 0)`),
++		)
++	})
++
+ 	t.Run("deploys managed dependencies", func(t *testing.T) {
+ 		wt := tc.NewWithT(t)
+ 
+@@ -57,9 +101,7 @@ func TestAzureKubernetesEngine(t *testing.T) {
+ 		})
+ 
+ 		// Verify dependency deployments are created
+-		wt.Get(gvk.Deployment, types.NamespacedName{
+-			Name: "cert-manager-operator-controller-manager", Namespace: "cert-manager-operator",
+-		}).Eventually().Should(Not(BeNil()))
++		wt.Eventually(func() bool { return hasCertManagerDeployments(wt) }).Should(BeTrue())
+ 
+ 		wt.Get(gvk.Deployment, types.NamespacedName{
+ 			Name: "openshift-lws-operator", Namespace: "openshift-lws-operator",
+@@ -77,11 +119,7 @@ func TestAzureKubernetesEngine(t *testing.T) {
+ 			CertManager: ccmcommon.CertManagerDependency{ManagementPolicy: ccmcommon.Managed},
+ 		})
+ 
+-		wt.Get(gvk.Deployment, types.NamespacedName{
+-			Name: "cert-manager-operator-controller-manager", Namespace: "cert-manager-operator",
+-		}).Eventually().Should(
+-			jq.Match(`.metadata.labels."%s" == "azurekubernetesengine"`, labels.InfrastructurePartOf),
+-		)
++		wt.Eventually(func() bool { return hasCertManagerDeployments(wt) }).Should(BeTrue())
+ 	})
+ 
+ 	t.Run("creates PKI bootstrap resources when cert-manager is installed", func(t *testing.T) {
+@@ -118,6 +156,157 @@ func TestAzureKubernetesEngine(t *testing.T) {
+ 	})
+ }
+ 
++// TestAzureKubernetesEngineGC tests garbage collection behavior. All subtests share a
++// single isolated envtest to reduce startup overhead. They run sequentially and each
++// creates/deletes its own CR via CreateCR cleanup. The "protected resources" subtest
++// must be last because it permanently registers cert-manager CRDs.
++func TestAzureKubernetesEngineGC(t *testing.T) {
++	ccmtest.RequireCharts(t)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	et, wt := ccmtest.StartIsolatedController(t, ctx, azureCfg)
++	t.Cleanup(cancel)
++
++	t.Run("deletes resources of dependency that transitions to Unmanaged", func(t *testing.T) {
++		// Start with cert-manager Managed — the controller deploys it.
++		ccmtest.CreateCR(t, wt, azureCfg, ccmcommon.Dependencies{
++			CertManager: ccmcommon.CertManagerDependency{ManagementPolicy: ccmcommon.Managed},
++		})
++
++		// Wait until the cert-manager Deployment exists.
++		wt.Eventually(func() bool { return hasCertManagerDeployments(wt) }).Should(BeTrue())
++
++		// Transition cert-manager to Unmanaged. Helm no longer renders cert-manager
++		// resources, so they retain stale generation annotations. GC deletes them.
++		ake := &ccmv1alpha1.AzureKubernetesEngine{}
++		wt.Expect(wt.Client().Get(wt.Context(),
++			types.NamespacedName{Name: ccmv1alpha1.AzureKubernetesEngineInstanceName}, ake)).To(Succeed())
++		ake.Spec.Dependencies.CertManager.ManagementPolicy = ccmcommon.Unmanaged
++		wt.Expect(wt.Client().Update(wt.Context(), ake)).To(Succeed())
++
++		wt.Eventually(func() bool {
++			list, err := listCertManagerDeployments(wt)
++			if err != nil {
++				return false
++			}
++			if len(list) == 0 {
++				return true
++			}
++			for i := range list {
++				if list[i].GetDeletionTimestamp() == nil {
++					return false
++				}
++			}
++			return true
++		}).Should(BeTrue())
++	})
++
++	t.Run("GC deletes stale resources with mismatched generation", func(t *testing.T) {
++		// Create the AKE CR — after the first reconcile, the CR gets a real UID and generation.
++		ccmtest.CreateCR(t, wt, azureCfg, ccmcommon.Dependencies{
++			CertManager: ccmcommon.CertManagerDependency{ManagementPolicy: ccmcommon.Managed},
++		})
++
++		// Wait for the CR to be reconciled (cert-manager deployment appears, which means
++		// the reconcile ran and the CR has a non-zero UID and generation).
++		wt.Eventually(func() bool { return hasCertManagerDeployments(wt) }).Should(BeTrue())
++
++		// Fetch the AKE CR to obtain its UID.
++		ake := &ccmv1alpha1.AzureKubernetesEngine{}
++		wt.Expect(wt.Client().Get(wt.Context(),
++			types.NamespacedName{Name: ccmv1alpha1.AzureKubernetesEngineInstanceName}, ake)).To(Succeed())
++
++		// Create a ConfigMap that looks like a stale owned CCM resource (wrong generation).
++		// GC only processes owned resources, so the ConfigMap must have an owner reference
++		// matching the AKE CR's GVK.
++		staleCM := &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "stale-ccm-resource",
++				Namespace: nsCertManagerOperator,
++				Labels: map[string]string{
++					labels.InfrastructurePartOf: "azurekubernetesengine",
++				},
++				Annotations: map[string]string{
++					annotations.InstanceUID: string(ake.GetUID()),
++					// A generation far in the past — will never match the current CR generation.
++					annotations.InstanceGeneration: strconv.FormatInt(-1, 10),
++				},
++				OwnerReferences: []metav1.OwnerReference{{
++					APIVersion: gvk.AzureKubernetesEngine.GroupVersion().String(),
++					Kind:       gvk.AzureKubernetesEngine.Kind,
++					Name:       ake.GetName(),
++					UID:        ake.GetUID(),
++				}},
++			},
++		}
++		wt.Expect(wt.Client().Create(wt.Context(), staleCM)).To(Succeed())
++		t.Cleanup(func() {
++			_ = wt.Client().Delete(wt.Context(), staleCM)
++		})
++
++		// Trigger a spec change to cause a cache miss → GC runs.
++		ake.Spec.Dependencies.LWS.ManagementPolicy = ccmcommon.Managed
++		wt.Expect(wt.Client().Update(wt.Context(), ake)).To(Succeed())
++
++		// GC should delete the stale resource. In envtest there is no garbage collector
++		// process, so Foreground deletion marks the object with a deletionTimestamp but
++		// does not remove it. Either outcome (gone or marked for deletion) confirms the
++		// GC predicate fired correctly.
++		wt.Get(gvk.ConfigMap, client.ObjectKeyFromObject(staleCM)).Eventually().Should(
++			Or(BeNil(), jq.Match(`.metadata.deletionTimestamp != null`)),
++		)
++	})
++
++	t.Run("GC keeps protected resources regardless of generation mismatch", func(t *testing.T) {
++		ccmtest.CreateCR(t, wt, azureCfg, ccmcommon.Dependencies{
++			CertManager: ccmcommon.CertManagerDependency{ManagementPolicy: ccmcommon.Managed},
++		})
++
++		wt.Eventually(func() bool { return hasCertManagerDeployments(wt) }).Should(BeTrue())
++
++		// Register cert-manager CRDs so we can create actual ClusterIssuer resources.
++		_, err := et.RegisterCertManagerCRDs(wt.Context(), envt.WithPermissiveSchema())
++		wt.Expect(err).NotTo(HaveOccurred())
++
++		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "cert-manager"}}
++		if err := wt.Client().Create(wt.Context(), ns); err != nil && !k8serr.IsAlreadyExists(err) {
++			wt.Expect(err).NotTo(HaveOccurred())
++		}
++
++		// Wait for the bootstrap PKI resources to be created.
++		wt.Get(gvk.CertManagerClusterIssuer, types.NamespacedName{Name: "opendatahub-selfsigned-issuer"}).
++			Eventually().ShouldNot(BeNil())
++
++		// Trigger a spec change → cache miss → GC runs.
++		ake := &ccmv1alpha1.AzureKubernetesEngine{}
++		wt.Expect(wt.Client().Get(wt.Context(),
++			types.NamespacedName{Name: ccmv1alpha1.AzureKubernetesEngineInstanceName}, ake)).To(Succeed())
++		ake.Spec.Dependencies.LWS.ManagementPolicy = ccmcommon.Managed
++		wt.Expect(wt.Client().Update(wt.Context(), ake)).To(Succeed())
++
++		// Wait for LWS deployment to confirm the reconcile (and GC) completed.
++		wt.Get(gvk.Deployment, types.NamespacedName{
++			Name: "openshift-lws-operator", Namespace: "openshift-lws-operator",
++		}).Eventually().Should(Not(BeNil()))
++
++		// The protected PKI resources must survive across GC runs.
++		NewWithT(t).Consistently(func() error {
++			return wt.Client().Get(wt.Context(), types.NamespacedName{Name: "opendatahub-selfsigned-issuer"},
++				resources.GvkToPartial(gvk.CertManagerClusterIssuer))
++		}).WithTimeout(5 * time.Second).WithPolling(250 * time.Millisecond).Should(Succeed())
++
++		NewWithT(t).Consistently(func() error {
++			return wt.Client().Get(wt.Context(), types.NamespacedName{Name: "opendatahub-ca", Namespace: "cert-manager"},
++				resources.GvkToPartial(gvk.CertManagerCertificate))
++		}).WithTimeout(5 * time.Second).WithPolling(250 * time.Millisecond).Should(Succeed())
++
++		NewWithT(t).Consistently(func() error {
++			return wt.Client().Get(wt.Context(), types.NamespacedName{Name: "opendatahub-ca-issuer"},
++				resources.GvkToPartial(gvk.CertManagerClusterIssuer))
++		}).WithTimeout(5 * time.Second).WithPolling(250 * time.Millisecond).Should(Succeed())
++	})
++}
++
+ // TestAzureKubernetesEngineWithoutCertManager tests cert-manager CRD absence and dynamic
+ // registration. Each sub-test uses an isolated envtest to start with zero cert-manager CRDs.
+ func TestAzureKubernetesEngineWithoutCertManager(t *testing.T) {
+diff --git a/internal/controller/cloudmanager/coreweave/coreweavekubernetesengine_controller.go b/internal/controller/cloudmanager/coreweave/coreweavekubernetesengine_controller.go
+index 6d92229075c9..c778fbfc931f 100644
+--- a/internal/controller/cloudmanager/coreweave/coreweavekubernetesengine_controller.go
++++ b/internal/controller/cloudmanager/coreweave/coreweavekubernetesengine_controller.go
+@@ -17,8 +17,11 @@ import (
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/operatorconfig"
+ )
+ 
++// NewReconciler sets up the CoreWeaveKubernetesEngine controller and registers it with the manager.
+ func NewReconciler(ctx context.Context, mgr ctrl.Manager, cfg *operatorconfig.CloudManagerConfig) error {
+ 	resourceID := labels.NormalizePartOfValue(ccmv1alpha1.CoreWeaveKubernetesEngineKind)
++	bootstrapConfig := certmanager.DefaultBootstrapConfig(certmanager.WithOperatorCert(cfg.RhaiOperatorNamespace))
++
+ 	_, err := reconciler.ReconcilerFor(mgr, &ccmv1alpha1.CoreWeaveKubernetesEngine{}).
+ 		WithDynamicOwnership().
+ 		Watches(
+@@ -29,14 +32,14 @@ func NewReconciler(ctx context.Context, mgr ctrl.Manager, cfg *operatorconfig.Cl
+ 		WithAction(initialize).
+ 		ComposeWith(certmanager.Bootstrap[*ccmv1alpha1.CoreWeaveKubernetesEngine](
+ 			ccmv1alpha1.CoreWeaveKubernetesEngineInstanceName,
+-			certmanager.DefaultBootstrapConfig(certmanager.WithOperatorCert(cfg.RhaiOperatorNamespace)),
++			bootstrapConfig,
+ 		)).
+ 		WithActionE(cloudmanager.NewReconcileAction(resourceID)).
++		// GC must be last: evaluates every CCM resource and removes stale or orphaned ones.
++		WithActionE(cloudmanager.NewGCAction(resourceID, cfg.RhaiOperatorNamespace,
++			cloudmanager.BootstrapProtectedObjects(bootstrapConfig),
++		)).
+ 		WithConditions(cloudmanager.ConditionsTypes...).
+ 		Build(ctx)
+-	if err != nil {
+-		return err
+-	}
+-
+-	return nil
++	return err
+ }
+diff --git a/internal/controller/cloudmanager/coreweave/coreweavekubernetesengine_controller_test.go b/internal/controller/cloudmanager/coreweave/coreweavekubernetesengine_controller_test.go
+index 698c951eeeb7..02d0ef5286f2 100644
+--- a/internal/controller/cloudmanager/coreweave/coreweavekubernetesengine_controller_test.go
++++ b/internal/controller/cloudmanager/coreweave/coreweavekubernetesengine_controller_test.go
+@@ -3,11 +3,14 @@ package coreweave_test
+ import (
+ 	"context"
+ 	"io"
++	"strconv"
+ 	"testing"
++	"time"
+ 
+ 	corev1 "k8s.io/api/core/v1"
+ 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+@@ -17,14 +20,42 @@ import (
+ 	ccmv1alpha1 "github.com/opendatahub-io/opendatahub-operator/v2/api/cloudmanager/coreweave/v1alpha1"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/cloudmanager/coreweave"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/annotations"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/labels"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/resources"
+ 	ccmtest "github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/cloudmanager"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/envt"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/matchers/jq"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/testf"
+ 
+ 	. "github.com/onsi/gomega"
+ )
+ 
++const nsCertManagerOperator = "cert-manager-operator"
++
++// listCertManagerDeployments returns the Deployments with the InfrastructurePartOf
++// label in the cert-manager operator namespace.
++func listCertManagerDeployments(wt *testf.WithT) ([]unstructured.Unstructured, error) {
++	list := &unstructured.UnstructuredList{}
++	list.SetGroupVersionKind(gvk.Deployment.GroupVersion().WithKind(gvk.Deployment.Kind + "List"))
++
++	if err := wt.Client().List(wt.Context(), list,
++		client.InNamespace(nsCertManagerOperator),
++		client.MatchingLabels{
++			labels.InfrastructurePartOf: labels.NormalizePartOfValue(ccmv1alpha1.CoreWeaveKubernetesEngineKind),
++		},
++	); err != nil {
++		return nil, err
++	}
++
++	return list.Items, nil
++}
++
++func hasCertManagerDeployments(wt *testf.WithT) bool {
++	items, err := listCertManagerDeployments(wt)
++	return err == nil && len(items) > 0
++}
++
+ var coreweaveCfg = ccmtest.ControllerTestConfig{
+ 	CRDSubdir:     "coreweave",
+ 	NewReconciler: coreweave.NewReconciler,
+@@ -177,3 +208,154 @@ func TestCoreWeaveKubernetesEngineWithoutCertManager(t *testing.T) {
+ 			Eventually().ShouldNot(BeNil())
+ 	})
+ }
++
++// TestCoreWeaveKubernetesEngineGC tests garbage collection behavior. All subtests share a
++// single isolated envtest to reduce startup overhead. They run sequentially and each
++// creates/deletes its own CR via CreateCR cleanup. The "protected resources" subtest
++// must be last because it permanently registers cert-manager CRDs.
++func TestCoreWeaveKubernetesEngineGC(t *testing.T) {
++	ccmtest.RequireCharts(t)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	et, wt := ccmtest.StartIsolatedController(t, ctx, coreweaveCfg)
++	t.Cleanup(cancel)
++
++	t.Run("deletes resources of dependency that transitions to Unmanaged", func(t *testing.T) {
++		// Start with cert-manager Managed — the controller deploys it.
++		ccmtest.CreateCR(t, wt, coreweaveCfg, ccmcommon.Dependencies{
++			CertManager: ccmcommon.CertManagerDependency{ManagementPolicy: ccmcommon.Managed},
++		})
++
++		// Wait until the cert-manager Deployment exists.
++		wt.Eventually(func() bool { return hasCertManagerDeployments(wt) }).Should(BeTrue())
++
++		// Transition cert-manager to Unmanaged. Helm no longer renders cert-manager
++		// resources, so they retain stale generation annotations. GC deletes them.
++		cke := &ccmv1alpha1.CoreWeaveKubernetesEngine{}
++		wt.Expect(wt.Client().Get(wt.Context(),
++			types.NamespacedName{Name: ccmv1alpha1.CoreWeaveKubernetesEngineInstanceName}, cke)).To(Succeed())
++		cke.Spec.Dependencies.CertManager.ManagementPolicy = ccmcommon.Unmanaged
++		wt.Expect(wt.Client().Update(wt.Context(), cke)).To(Succeed())
++
++		wt.Eventually(func() bool {
++			list, err := listCertManagerDeployments(wt)
++			if err != nil {
++				return false
++			}
++			if len(list) == 0 {
++				return true
++			}
++			for i := range list {
++				if list[i].GetDeletionTimestamp() == nil {
++					return false
++				}
++			}
++			return true
++		}).Should(BeTrue())
++	})
++
++	t.Run("GC deletes stale resources with mismatched generation", func(t *testing.T) {
++		// Create the CKE CR — after the first reconcile, the CR gets a real UID and generation.
++		ccmtest.CreateCR(t, wt, coreweaveCfg, ccmcommon.Dependencies{
++			CertManager: ccmcommon.CertManagerDependency{ManagementPolicy: ccmcommon.Managed},
++		})
++
++		// Wait for the CR to be reconciled (cert-manager deployment appears, which means
++		// the reconcile ran and the CR has a non-zero UID and generation).
++		wt.Eventually(func() bool { return hasCertManagerDeployments(wt) }).Should(BeTrue())
++
++		// Fetch the CKE CR to obtain its UID.
++		cke := &ccmv1alpha1.CoreWeaveKubernetesEngine{}
++		wt.Expect(wt.Client().Get(wt.Context(),
++			types.NamespacedName{Name: ccmv1alpha1.CoreWeaveKubernetesEngineInstanceName}, cke)).To(Succeed())
++
++		// Create a ConfigMap that looks like a stale owned CCM resource (wrong generation).
++		// GC only processes owned resources, so the ConfigMap must have an owner reference
++		// matching the CKE CR's GVK.
++		staleCM := &corev1.ConfigMap{
++			ObjectMeta: metav1.ObjectMeta{
++				Name:      "stale-ccm-resource",
++				Namespace: nsCertManagerOperator,
++				Labels: map[string]string{
++					labels.InfrastructurePartOf: "coreweavekubernetesengine",
++				},
++				Annotations: map[string]string{
++					annotations.InstanceUID: string(cke.GetUID()),
++					// A generation far in the past — will never match the current CR generation.
++					annotations.InstanceGeneration: strconv.FormatInt(-1, 10),
++				},
++				OwnerReferences: []metav1.OwnerReference{{
++					APIVersion: gvk.CoreWeaveKubernetesEngine.GroupVersion().String(),
++					Kind:       gvk.CoreWeaveKubernetesEngine.Kind,
++					Name:       cke.GetName(),
++					UID:        cke.GetUID(),
++				}},
++			},
++		}
++		wt.Expect(wt.Client().Create(wt.Context(), staleCM)).To(Succeed())
++		t.Cleanup(func() {
++			_ = wt.Client().Delete(wt.Context(), staleCM)
++		})
++
++		// Trigger a spec change to cause a cache miss → GC runs.
++		cke.Spec.Dependencies.LWS.ManagementPolicy = ccmcommon.Managed
++		wt.Expect(wt.Client().Update(wt.Context(), cke)).To(Succeed())
++
++		// GC should delete the stale resource. In envtest there is no garbage collector
++		// process, so Foreground deletion marks the object with a deletionTimestamp but
++		// does not remove it. Either outcome (gone or marked for deletion) confirms the
++		// GC predicate fired correctly.
++		wt.Get(gvk.ConfigMap, client.ObjectKeyFromObject(staleCM)).Eventually().Should(
++			Or(BeNil(), jq.Match(`.metadata.deletionTimestamp != null`)),
++		)
++	})
++
++	t.Run("GC keeps protected resources regardless of generation mismatch", func(t *testing.T) {
++		ccmtest.CreateCR(t, wt, coreweaveCfg, ccmcommon.Dependencies{
++			CertManager: ccmcommon.CertManagerDependency{ManagementPolicy: ccmcommon.Managed},
++		})
++
++		wt.Eventually(func() bool { return hasCertManagerDeployments(wt) }).Should(BeTrue())
++
++		// Register cert-manager CRDs so we can create actual ClusterIssuer resources.
++		_, err := et.RegisterCertManagerCRDs(wt.Context(), envt.WithPermissiveSchema())
++		wt.Expect(err).NotTo(HaveOccurred())
++
++		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "cert-manager"}}
++		if err := wt.Client().Create(wt.Context(), ns); err != nil && !k8serr.IsAlreadyExists(err) {
++			wt.Expect(err).NotTo(HaveOccurred())
++		}
++
++		// Wait for the bootstrap PKI resources to be created.
++		wt.Get(gvk.CertManagerClusterIssuer, types.NamespacedName{Name: "opendatahub-selfsigned-issuer"}).
++			Eventually().ShouldNot(BeNil())
++
++		// Trigger a spec change → cache miss → GC runs.
++		cke := &ccmv1alpha1.CoreWeaveKubernetesEngine{}
++		wt.Expect(wt.Client().Get(wt.Context(),
++			types.NamespacedName{Name: ccmv1alpha1.CoreWeaveKubernetesEngineInstanceName}, cke)).To(Succeed())
++		cke.Spec.Dependencies.LWS.ManagementPolicy = ccmcommon.Managed
++		wt.Expect(wt.Client().Update(wt.Context(), cke)).To(Succeed())
++
++		// Wait for LWS deployment to confirm the reconcile (and GC) completed.
++		wt.Get(gvk.Deployment, types.NamespacedName{
++			Name: "openshift-lws-operator", Namespace: "openshift-lws-operator",
++		}).Eventually().Should(Not(BeNil()))
++
++		// The protected PKI resources must survive across GC runs.
++		NewWithT(t).Consistently(func() error {
++			return wt.Client().Get(wt.Context(), types.NamespacedName{Name: "opendatahub-selfsigned-issuer"},
++				resources.GvkToPartial(gvk.CertManagerClusterIssuer))
++		}).WithTimeout(5 * time.Second).WithPolling(250 * time.Millisecond).Should(Succeed())
++
++		NewWithT(t).Consistently(func() error {
++			return wt.Client().Get(wt.Context(), types.NamespacedName{Name: "opendatahub-ca", Namespace: "cert-manager"},
++				resources.GvkToPartial(gvk.CertManagerCertificate))
++		}).WithTimeout(5 * time.Second).WithPolling(250 * time.Millisecond).Should(Succeed())
++
++		NewWithT(t).Consistently(func() error {
++			return wt.Client().Get(wt.Context(), types.NamespacedName{Name: "opendatahub-ca-issuer"},
++				resources.GvkToPartial(gvk.CertManagerClusterIssuer))
++		}).WithTimeout(5 * time.Second).WithPolling(250 * time.Millisecond).Should(Succeed())
++	})
++}
+diff --git a/pkg/controller/actions/dependency/certmanager/bootstrap.go b/pkg/controller/actions/dependency/certmanager/bootstrap.go
+index 775ad9d9a18c..eb26cb27c700 100644
+--- a/pkg/controller/actions/dependency/certmanager/bootstrap.go
++++ b/pkg/controller/actions/dependency/certmanager/bootstrap.go
+@@ -31,16 +31,18 @@ import (
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/dependency"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/handlers"
++	resourcespredicates "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/predicates/resources"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/reconciler"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/env"
+ )
+ 
+-// caRootDuration is the validity period of the root CA certificate.
+-// This value is intentionally long. The renewal strategy will be defined in future changes.
++// caRootDuration is the validity period of the root CA certificate (~100 years).
++// No automatic renewal is configured; a renewal strategy is tracked as a follow-up.
+ const caRootDuration = "876000h"
+ 
+-// Core cert-manager CRD resource names.
++// These CRD names must be covered consistently by MonitorCRDs and CRDPredicate.
++// If a CRD is added here, update both functions.
+ const (
+ 	certManagerCertificateCRD   = "certificates.cert-manager.io"
+ 	certManagerIssuerCRD        = "issuers.cert-manager.io"
+@@ -149,9 +151,7 @@ func BootstrapOperatorCertConfig(namespace string) *OperatorCertConfig {
+ }
+ 
+ // NewBootstrapAction returns a reusable pipeline action that adds the cert-manager PKI trust
+-// chain resources to the reconciliation request for deployment by the pipeline's deploy action.
+-//
+-// The chain consists of:
++// chain resources to the reconciliation request for deployment by the pipeline's deploy action:
+ //
+ // - a self-signed ClusterIssuer
+ // - a root CA Certificate
+@@ -219,6 +219,7 @@ func createSelfSignedIssuer(config BootstrapConfig) (*unstructured.Unstructured,
+ 	return u, nil
+ }
+ 
++// createRootCACertificate returns the root CA Certificate issued by the self-signed ClusterIssuer.
+ func createRootCACertificate(config BootstrapConfig) (*unstructured.Unstructured, error) {
+ 	u := &unstructured.Unstructured{}
+ 	u.SetGroupVersionKind(gvk.CertManagerCertificate)
+@@ -286,9 +287,6 @@ func createCABackedIssuer(config BootstrapConfig) (*unstructured.Unstructured, e
+ // MonitorCRDs returns a dependency.ActionOpts that checks whether the three core cert-manager
+ // CRDs (Certificate, Issuer, ClusterIssuer) are registered on the cluster. If any CRD
+ // is absent, DependenciesAvailable is set to False.
+-//
+-// Must cover exactly the same CRDs as CRDPredicate. If a CRD is added here, add the
+-// corresponding name to the constants block above and update CRDPredicate.
+ func MonitorCRDs() dependency.ActionOpts {
+ 	return dependency.Combine(
+ 		dependency.MonitorCRD(dependency.CRDConfig{GVK: gvk.CertManagerCertificate}),
+@@ -299,9 +297,6 @@ func MonitorCRDs() dependency.ActionOpts {
+ 
+ // CRDPredicate returns a predicate that matches CustomResourceDefinition events for
+ // the three core cert-manager CRDs.
+-//
+-// Must cover exactly the same CRDs as MonitorCRDs. If a CRD is added to MonitorCRDs,
+-// add the corresponding name to the constants block above and update this predicate.
+ func CRDPredicate() predicate.Predicate {
+ 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
+ 		switch obj.GetName() {
+@@ -315,27 +310,51 @@ func CRDPredicate() predicate.Predicate {
+ // Bootstrap returns a builder configurator that registers all cert-manager bootstrapping
+ // concerns onto the builder:
+ //
+-// - a cert-manager CRDs watch to trigger reconciliation,
+-// - a monitoring action to set the DependenciesAvailable condition,
+-// - a bootstrap action to deploy the PKI trust chain,
+-// - a condition to set the DependenciesAvailable status.
++//   - a cert-manager CRDs watch to trigger reconciliation when cert-manager is installed,
++//   - explicit watches for the PKI resource instances (ClusterIssuers, Certificate)
++//     so the controller reconciles when they are modified or deleted,
++//   - a monitoring action to set the DependenciesAvailable condition,
++//   - a bootstrap action to deploy the PKI trust chain,
++//   - a condition to set the DependenciesAvailable status.
+ //
+ // instanceName is the controller's singleton instance name, used to route CRD watch events
+ // to the correct reconciler queue via handlers.ToNamed.
+ //
+ // [BootstrapConfig] is the configuration for the cert-manager PKI trust chain.
+ //
+-// Use with [reconciler.ComposeWith]. T must be supplied explicitly because Go cannot infer
+-// it from the function arguments:
++// Use with [reconciler.ComposeWith]:
+ //
+ //	b.ComposeWith(certmanager.Bootstrap[*MyControllerType](instanceName, certmanager.DefaultBootstrapConfig()))
+ func Bootstrap[T common.PlatformObject](instanceName string, config BootstrapConfig) func(*reconciler.ReconcilerBuilder[T]) {
+ 	return func(b *reconciler.ReconcilerBuilder[T]) {
++		certPredicates := []predicate.Predicate{
++			resourcespredicates.CreatedOrUpdatedOrDeletedNamedInNamespace(config.CertName, config.CertManagerNamespace),
++		}
++		if config.OperatorCertConfig != nil {
++			certPredicates = append(certPredicates,
++				resourcespredicates.CreatedOrUpdatedOrDeletedNamedInNamespace(
++					config.OperatorCertConfig.WebhookCertName, config.OperatorCertConfig.Namespace),
++			)
++		}
++
+ 		b.Watches(
+ 			&extv1.CustomResourceDefinition{},
+ 			reconciler.WithEventHandler(handlers.ToNamed(instanceName)),
+ 			reconciler.WithPredicates(CRDPredicate()),
+ 		).
++			WatchesGVK(gvk.CertManagerClusterIssuer,
++				reconciler.WithEventHandler(handlers.ToNamed(instanceName)),
++				reconciler.WithPredicates(predicate.Or(
++					resourcespredicates.CreatedOrUpdatedOrDeletedNamed(config.IssuerName),
++					resourcespredicates.CreatedOrUpdatedOrDeletedNamed(config.CAIssuerName),
++				)),
++				reconciler.Dynamic(reconciler.CrdExists(gvk.CertManagerClusterIssuer)),
++			).
++			WatchesGVK(gvk.CertManagerCertificate,
++				reconciler.WithEventHandler(handlers.ToNamed(instanceName)),
++				reconciler.WithPredicates(predicate.Or(certPredicates...)),
++				reconciler.Dynamic(reconciler.CrdExists(gvk.CertManagerCertificate)),
++			).
+ 			WithAction(dependency.NewAction(MonitorCRDs())).
+ 			WithActionE(NewBootstrapAction(config)).
+ 			WithConditions(status.ConditionDependenciesAvailable)
+diff --git a/pkg/controller/actions/gc/action_gc.go b/pkg/controller/actions/gc/action_gc.go
+index 9fe8af3c8381..27c35f23d8de 100644
+--- a/pkg/controller/actions/gc/action_gc.go
++++ b/pkg/controller/actions/gc/action_gc.go
+@@ -186,7 +186,7 @@ func (a *Action) computeDeletableTypes(ctx context.Context, rr *odhTypes.Reconci
+ 		return nil, fmt.Errorf("unable to compute namespace: %w", err)
+ 	}
+ 
+-	items, err := rules.ListAuthorizedDeletableResources(ctx, rr.Client, res, ns)
++	items, err := rules.ListAuthorizedResources(ctx, rr.Client, res, ns, []string{rules.VerbDelete})
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failure listing authorized deletable resources: %w", err)
+ 	}
+diff --git a/pkg/controller/cloudmanager/action_gc.go b/pkg/controller/cloudmanager/action_gc.go
+new file mode 100644
+index 000000000000..f541dd203a22
+--- /dev/null
++++ b/pkg/controller/cloudmanager/action_gc.go
+@@ -0,0 +1,138 @@
++package cloudmanager
++
++import (
++	"errors"
++	"fmt"
++	"strconv"
++
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	logf "sigs.k8s.io/controller-runtime/pkg/log"
++
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions"
++	certmanager "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/dependency/certmanager"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/gc"
++	odhTypes "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/annotations"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/labels"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/resources"
++)
++
++// ProtectedObject identifies a resource that GC must never delete. Matching uses
++// Group+Kind (version-agnostic) plus Name and optional Namespace, so the filter
++// survives API version upgrades.
++type ProtectedObject struct {
++	Group     string
++	Kind      string
++	Name      string
++	Namespace string // empty for cluster-scoped resources
++}
++
++// newGCPredicate returns the ObjectPredicateFn used by NewGCAction.
++//
++// Unlike the generic DefaultObjectPredicate (which keeps unannotated resources),
++// the CCM predicate also keeps them: resources without InstanceUID or InstanceGeneration
++// annotations are not CCM-managed and should not be touched.
++//
++// The predicate evaluates each resource in order:
++//   - Object matches a protected Group+Kind+Name+Namespace: keep.
++//   - Missing InstanceUID or InstanceGeneration annotations: keep (not a CCM resource).
++//   - UID mismatch with the current CR: delete (orphaned from a different CR instance).
++//   - Generation mismatch with the current CR: delete (stale resource).
++func newGCPredicate(protectedObjects []ProtectedObject) gc.ObjectPredicateFn {
++	log := logf.Log.WithName("ccm-gc")
++	protected := make(map[ProtectedObject]struct{}, len(protectedObjects))
++	for _, obj := range protectedObjects {
++		protected[obj] = struct{}{}
++	}
++
++	return func(rr *odhTypes.ReconciliationRequest, obj unstructured.Unstructured) (bool, error) {
++		objGVK := obj.GroupVersionKind()
++		key := ProtectedObject{Group: objGVK.Group, Kind: objGVK.Kind, Namespace: obj.GetNamespace(), Name: obj.GetName()}
++		if _, ok := protected[key]; ok {
++			log.V(3).Info("GC: keeping protected resource", "gvk", objGVK, "name", obj.GetName(), "namespace", obj.GetNamespace())
++			return false, nil
++		}
++
++		iUID := resources.GetAnnotation(&obj, annotations.InstanceUID)
++		iGeneration := resources.GetAnnotation(&obj, annotations.InstanceGeneration)
++
++		if iUID == "" || iGeneration == "" {
++			return false, nil
++		}
++
++		if iUID != string(rr.Instance.GetUID()) {
++			log.V(3).Info("GC: deleting orphaned resource (UID mismatch)", "gvk", objGVK, "name", obj.GetName(), "namespace", obj.GetNamespace())
++			return true, nil
++		}
++
++		iGenerationInt, err := strconv.ParseInt(iGeneration, 10, 64)
++		if err != nil {
++			log.Error(err, "cannot parse InstanceGeneration annotation, skipping resource",
++				"annotation", iGeneration, "gvk", objGVK, "name", obj.GetName(), "namespace", obj.GetNamespace())
++
++			return false, nil
++		}
++
++		shouldDelete := rr.Instance.GetGeneration() != iGenerationInt
++		if shouldDelete {
++			log.V(3).Info("GC: deleting stale resource (generation mismatch)", "gvk", objGVK, "name", obj.GetName(), "namespace", obj.GetNamespace(),
++				"resourceGeneration", iGenerationInt, "crGeneration", rr.Instance.GetGeneration())
++		}
++
++		return shouldDelete, nil
++	}
++}
++
++// BootstrapProtectedObjects returns the ProtectedObject entries for the PKI resources
++// created by the cert-manager bootstrap action.
++//
++// Only the long-lived PKI infrastructure is protected: the self-signed ClusterIssuer,
++// the root CA Certificate, and the CA-backed ClusterIssuer. The webhook Certificate
++// is intentionally excluded because it is recreated on every reconcile with a fresh
++// generation annotation, so GC will never see a stale version.
++func BootstrapProtectedObjects(config certmanager.BootstrapConfig) []ProtectedObject {
++	return []ProtectedObject{
++		{Group: gvk.CertManagerClusterIssuer.Group, Kind: gvk.CertManagerClusterIssuer.Kind, Name: config.IssuerName},
++		{Group: gvk.CertManagerCertificate.Group, Kind: gvk.CertManagerCertificate.Kind, Name: config.CertName, Namespace: config.CertManagerNamespace},
++		{Group: gvk.CertManagerClusterIssuer.Group, Kind: gvk.CertManagerClusterIssuer.Kind, Name: config.CAIssuerName},
++	}
++}
++
++// NewGCAction returns a GC action configured for cloud manager resources.
++//
++// resourceID must be the normalized InfrastructurePartOf label value for this controller.
++// NewGCAction normalizes it internally and returns an error if empty.
++//
++// The GC scans all resource types the operator is authorized to delete (using the
++// operator namespace for permission checks), lists resources cluster-wide filtered
++// by the InfrastructurePartOf label, and evaluates each with newGCPredicate.
++// Only owned resources are processed.
++//
++// NewGCAction must be the last action in the reconciliation pipeline. GC only runs
++// when rr.Generated is true (i.e., on cache miss — when something actually changed).
++// In steady state with no spec changes, GC is skipped entirely.
++func NewGCAction(resourceID string, operatorNamespace string, protectedObjects []ProtectedObject) (actions.Fn, error) {
++	resourceID = labels.NormalizePartOfValue(resourceID)
++	if resourceID == "" {
++		return nil, errors.New("NewGCAction: resourceID is required")
++	}
++
++	if operatorNamespace == "" {
++		return nil, errors.New("NewGCAction: operatorNamespace is required")
++	}
++
++	for i, po := range protectedObjects {
++		if po.Kind == "" || po.Name == "" {
++			return nil, fmt.Errorf("NewGCAction: protectedObjects[%d] requires both Kind and Name", i)
++		}
++	}
++
++	return gc.NewAction(
++		gc.InNamespace(operatorNamespace),
++		gc.WithLabel(labels.InfrastructurePartOf, resourceID),
++		gc.WithObjectPredicate(newGCPredicate(protectedObjects)),
++		gc.WithUnremovables(gvk.Namespace),
++		gc.WithOnlyCollectOwned(true),
++	), nil
++}
+diff --git a/pkg/controller/cloudmanager/action_gc_test.go b/pkg/controller/cloudmanager/action_gc_test.go
+new file mode 100644
+index 000000000000..ecdcf69a4501
+--- /dev/null
++++ b/pkg/controller/cloudmanager/action_gc_test.go
+@@ -0,0 +1,256 @@
++//nolint:testpackage // white-box tests for unexported GC predicate
++package cloudmanager
++
++import (
++	"testing"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++	k8stypes "k8s.io/apimachinery/pkg/types"
++
++	ccmv1alpha1 "github.com/opendatahub-io/opendatahub-operator/v2/api/cloudmanager/azure/v1alpha1"
++	odhTypes "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/annotations"
++
++	. "github.com/onsi/gomega"
++)
++
++const (
++	testUID        = k8stypes.UID("test-uid-123")
++	testGeneration = int64(5)
++)
++
++// newTestRR creates a minimal ReconciliationRequest for unit tests.
++func newTestRR(resourcesList []unstructured.Unstructured) *odhTypes.ReconciliationRequest {
++	instance := &ccmv1alpha1.AzureKubernetesEngine{
++		ObjectMeta: metav1.ObjectMeta{
++			UID:        testUID,
++			Generation: testGeneration,
++		},
++	}
++	return &odhTypes.ReconciliationRequest{
++		Instance:  instance,
++		Resources: resourcesList,
++	}
++}
++
++// newObj creates an unstructured object with the given GVK, name, namespace, and annotations.
++func newObj(objGVK schema.GroupVersionKind, name, namespace string, anns map[string]string) unstructured.Unstructured {
++	obj := unstructured.Unstructured{}
++	obj.SetGroupVersionKind(objGVK)
++	obj.SetName(name)
++	obj.SetNamespace(namespace)
++	obj.SetAnnotations(anns)
++	return obj
++}
++
++// simpleObj creates an unstructured object for annotation-only tests.
++func simpleObj(anns map[string]string) unstructured.Unstructured {
++	return newObj(schema.GroupVersionKind{}, "", "", anns)
++}
++
++// ccmAnns returns the standard cloud manager annotations for the test UID and generation.
++func ccmAnns(uid string, generation string) map[string]string {
++	return map[string]string{
++		annotations.InstanceUID:        uid,
++		annotations.InstanceGeneration: generation,
++	}
++}
++
++var testProtectedObjects = []ProtectedObject{
++	{Group: "cert-manager.io", Kind: "ClusterIssuer", Name: "opendatahub-selfsigned-issuer"},
++	{Group: "cert-manager.io", Kind: "Certificate", Name: "opendatahub-ca", Namespace: "cert-manager"},
++}
++
++func TestNewGCPredicate(t *testing.T) {
++	t.Parallel()
++
++	rr := newTestRR(nil)
++
++	cases := []struct {
++		name       string
++		obj        unstructured.Unstructured
++		wantDelete bool
++	}{
++		{
++			name:       "missing both annotations — keep",
++			obj:        simpleObj(nil),
++			wantDelete: false,
++		},
++		{
++			name:       "missing UID annotation only — keep",
++			obj:        simpleObj(map[string]string{annotations.InstanceGeneration: "5"}),
++			wantDelete: false,
++		},
++		{
++			name:       "missing generation annotation only — keep",
++			obj:        simpleObj(map[string]string{annotations.InstanceUID: string(testUID)}),
++			wantDelete: false,
++		},
++		{
++			name:       "empty-string UID annotation — keep",
++			obj:        simpleObj(ccmAnns("", "5")),
++			wantDelete: false,
++		},
++		{
++			name:       "empty-string generation annotation — keep",
++			obj:        simpleObj(map[string]string{annotations.InstanceUID: string(testUID), annotations.InstanceGeneration: ""}),
++			wantDelete: false,
++		},
++		{
++			name: "protected object — keep, even with UID mismatch",
++			obj: newObj(
++				schema.GroupVersionKind{Group: "cert-manager.io", Version: "v1", Kind: "ClusterIssuer"},
++				"opendatahub-selfsigned-issuer", "",
++				ccmAnns("different-uid", "5"),
++			),
++			wantDelete: false,
++		},
++		{
++			name: "protected object with different API version — keep (version-agnostic)",
++			obj: newObj(
++				schema.GroupVersionKind{Group: "cert-manager.io", Version: "v2beta1", Kind: "ClusterIssuer"},
++				"opendatahub-selfsigned-issuer", "",
++				ccmAnns(string(testUID), "3"),
++			),
++			wantDelete: false,
++		},
++		{
++			name: "protected namespaced object — keep",
++			obj: newObj(
++				schema.GroupVersionKind{Group: "cert-manager.io", Version: "v1", Kind: "Certificate"},
++				"opendatahub-ca", "cert-manager",
++				ccmAnns(string(testUID), "3"),
++			),
++			wantDelete: false,
++		},
++		{
++			name: "same GVK+name as protected but different namespace — not protected, delete",
++			obj: newObj(
++				schema.GroupVersionKind{Group: "cert-manager.io", Version: "v1", Kind: "Certificate"},
++				"opendatahub-ca", "other-namespace",
++				ccmAnns(string(testUID), "3"),
++			),
++			wantDelete: true,
++		},
++		{
++			name:       "UID mismatch — orphaned resource, delete",
++			obj:        simpleObj(ccmAnns("different-uid", "5")),
++			wantDelete: true,
++		},
++		{
++			name:       "UID matches, generation matches — keep",
++			obj:        simpleObj(ccmAnns(string(testUID), "5")),
++			wantDelete: false,
++		},
++		{
++			name:       "UID matches, generation mismatch — delete",
++			obj:        simpleObj(ccmAnns(string(testUID), "3")),
++			wantDelete: true,
++		},
++		{
++			name:       "malformed InstanceGeneration — skip (do not delete)",
++			obj:        simpleObj(ccmAnns(string(testUID), "not-a-number")),
++			wantDelete: false,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			g := NewWithT(t)
++			pred := newGCPredicate(testProtectedObjects)
++			got, err := pred(rr, tc.obj)
++			g.Expect(err).NotTo(HaveOccurred())
++			g.Expect(got).To(Equal(tc.wantDelete))
++		})
++	}
++}
++
++func TestNewGCPredicate_NoProtectedObjects(t *testing.T) {
++	t.Parallel()
++	g := NewWithT(t)
++
++	rr := newTestRR(nil)
++	pred := newGCPredicate(nil)
++
++	// Without protected objects, generation mismatch deletes.
++	obj := simpleObj(ccmAnns(string(testUID), "3"))
++	got, err := pred(rr, obj)
++	g.Expect(err).NotTo(HaveOccurred())
++	g.Expect(got).To(BeTrue())
++}
++
++func TestNewGCAction(t *testing.T) {
++	t.Parallel()
++
++	cases := []struct {
++		name             string
++		resourceID       string
++		operatorNS       string
++		protectedObjects []ProtectedObject
++		wantErrContains  string
++	}{
++		{
++			name:            "empty resourceID returns error",
++			resourceID:      "",
++			operatorNS:      "test-ns",
++			wantErrContains: "resourceID is required",
++		},
++		{
++			name:            "empty operatorNamespace returns error",
++			resourceID:      "test-resource",
++			operatorNS:      "",
++			wantErrContains: "operatorNamespace is required",
++		},
++		{
++			name:       "protected object with empty Kind returns error",
++			resourceID: "test-resource",
++			operatorNS: "test-ns",
++			protectedObjects: []ProtectedObject{
++				{Group: "cert-manager.io", Name: "test"},
++			},
++			wantErrContains: "requires both Kind and Name",
++		},
++		{
++			name:       "protected object with empty Name returns error",
++			resourceID: "test-resource",
++			operatorNS: "test-ns",
++			protectedObjects: []ProtectedObject{
++				{Group: "cert-manager.io", Kind: "Certificate"},
++			},
++			wantErrContains: "requires both Kind and Name",
++		},
++		{
++			name:       "valid parameters return non-nil action",
++			resourceID: "test-resource",
++			operatorNS: "test-ns",
++			protectedObjects: []ProtectedObject{
++				{Group: "cert-manager.io", Kind: "Certificate", Name: "test-cert"},
++			},
++		},
++		{
++			name:             "nil protected objects is valid",
++			resourceID:       "test-resource",
++			operatorNS:       "test-ns",
++			protectedObjects: nil,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			g := NewWithT(t)
++			fn, err := NewGCAction(tc.resourceID, tc.operatorNS, tc.protectedObjects)
++			if tc.wantErrContains != "" {
++				g.Expect(err).To(HaveOccurred())
++				g.Expect(err.Error()).To(ContainSubstring(tc.wantErrContains))
++				g.Expect(fn).To(BeNil())
++				return
++			}
++			g.Expect(err).NotTo(HaveOccurred())
++			g.Expect(fn).NotTo(BeNil())
++		})
++	}
++}
+diff --git a/pkg/controller/predicates/resources/resources.go b/pkg/controller/predicates/resources/resources.go
+index 0986811dc655..43381dca70e6 100644
+--- a/pkg/controller/predicates/resources/resources.go
++++ b/pkg/controller/predicates/resources/resources.go
+@@ -267,6 +267,15 @@ func CreatedOrUpdatedOrDeletedNamed(name string) predicate.Predicate {
+ 	}
+ }
+ 
++func CreatedOrUpdatedOrDeletedNamedInNamespace(name, namespace string) predicate.Predicate {
++	return predicate.And(
++		CreatedOrUpdatedOrDeletedNamed(name),
++		predicate.NewPredicateFuncs(func(obj client.Object) bool {
++			return obj.GetNamespace() == namespace
++		}),
++	)
++}
++
+ func CreatedOrUpdatedOrDeletedNamePrefixed(namePrefix string) predicate.Predicate {
+ 	return predicate.Funcs{
+ 		CreateFunc: func(e event.TypedCreateEvent[client.Object]) bool {
+diff --git a/pkg/controller/predicates/resources/resources_test.go b/pkg/controller/predicates/resources/resources_test.go
+index d9309d7b9ede..af7b9ba630ad 100644
+--- a/pkg/controller/predicates/resources/resources_test.go
++++ b/pkg/controller/predicates/resources/resources_test.go
+@@ -926,6 +926,40 @@ func TestCreatedOrUpdatedOrDeletedNamed(t *testing.T) {
+ 	})
+ }
+ 
++func TestCreatedOrUpdatedOrDeletedNamedInNamespace(t *testing.T) {
++	t.Parallel()
++
++	pred := resources.CreatedOrUpdatedOrDeletedNamedInNamespace("test-name", "test-ns")
++
++	obj := func(name, ns string) *corev1.Pod {
++		return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}}
++	}
++
++	cases := []struct {
++		name      string
++		objName   string
++		objNS     string
++		wantMatch bool
++	}{
++		{"matching name and namespace", "test-name", "test-ns", true},
++		{"matching name, wrong namespace", "test-name", "other-ns", false},
++		{"wrong name, matching namespace", "other-name", "test-ns", false},
++		{"wrong name and namespace", "other-name", "other-ns", false},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			g := NewWithT(t)
++			o := obj(tc.objName, tc.objNS)
++
++			g.Expect(pred.Create(event.CreateEvent{Object: o})).To(Equal(tc.wantMatch))
++			g.Expect(pred.Update(event.UpdateEvent{ObjectNew: o})).To(Equal(tc.wantMatch))
++			g.Expect(pred.Delete(event.DeleteEvent{Object: o})).To(Equal(tc.wantMatch))
++		})
++	}
++}
++
+ func TestCreatedOrUpdatedOrDeletedNamePrefixed(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/pkg/controller/reconciler/reconciler_support.go b/pkg/controller/reconciler/reconciler_support.go
+index ed39166194a2..ed979036c8aa 100644
+--- a/pkg/controller/reconciler/reconciler_support.go
++++ b/pkg/controller/reconciler/reconciler_support.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/dynamicownership"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/handlers"
+@@ -260,6 +261,10 @@ func (b *ReconcilerBuilder[T]) WithDynamicOwnership(opts ...DynamicOwnershipOpti
+ 	for _, opt := range opts {
+ 		opt(cfg)
+ 	}
++
++	// Namespaces are always excluded: setting owner references on a Namespace
++	// causes cascade deletion of the entire namespace when the CR is deleted.
++	b.excludeFromOwnership = append(b.excludeFromOwnership, gvk.Namespace)
+ 	b.excludeFromOwnership = append(b.excludeFromOwnership, cfg.excludeGVKs...)
+ 	b.dynamicOwnershipGVKPreds = cfg.gvkPredicates
+ 
+diff --git a/pkg/rules/rules.go b/pkg/rules/rules.go
+index 20e25c5de35d..66082a697592 100644
+--- a/pkg/rules/rules.go
++++ b/pkg/rules/rules.go
+@@ -104,40 +104,35 @@ func IsResourceMatchingRule(
+ 	return false
+ }
+ 
+-// HasDeletePermission checks if the current subject has permission to delete a specific API
++// HasPermissions checks if the current subject has the required permissions for a specific API
+ // resource based on the provided authorization rules.
+ //
+-// Parameters:
+-//   - group: The API group of the resource to check
+-//   - apiRes: The API resource metadata
+-//   - permissionRules: A slice of authorization rules to check against
+-//
+-// Returns:
+-//   - bool: true if the resource can be deleted by the current subject, false otherwise
+-func HasDeletePermission(
++// Returns false when requiredVerbs is empty or nil (no permissions are granted when
++// no permissions are requested).
++func HasPermissions(
+ 	group string,
+ 	apiRes metav1.APIResource,
+ 	permissionRules []authorizationv1.ResourceRule,
++	requiredVerbs []string,
+ ) bool {
+-	for _, rule := range permissionRules {
+-		// Skip if the rule doesn't grant delete permission
+-		if !slices.Contains(rule.Verbs, VerbDelete) && !slices.Contains(rule.Verbs, VerbAny) {
+-			continue
+-		}
++	if len(requiredVerbs) == 0 {
++		return false
++	}
+ 
+-		// Skip if the resource doesn't match this rule
+-		if !IsResourceMatchingRule(group, apiRes, rule) {
+-			continue
++	for _, requiredVerb := range requiredVerbs {
++		if !slices.ContainsFunc(permissionRules, func(rule authorizationv1.ResourceRule) bool {
++			return (slices.Contains(rule.Verbs, requiredVerb) || slices.Contains(rule.Verbs, VerbAny)) &&
++				IsResourceMatchingRule(group, apiRes, rule)
++		}) {
++			return false
+ 		}
+-
+-		return true
+ 	}
+ 
+-	return false
++	return true
+ }
+ 
+-// ComputeDeletableResources returns a sorted list of Kubernetes resources that the user
+-// is authorized to delete, based on the available API resources and RBAC rules.
++// ComputeAuthorizedResources returns a sorted list of Kubernetes resources that the user
++// is authorized to interact with based on the required verbs, available API resources, and RBAC rules.
+ //
+ // Parameters:
+ //   - resourceLists: A slice of metav1.APIResourceList. Each entry describes a group/version
+@@ -145,15 +140,17 @@ func HasDeletePermission(
+ //   - rules: A slice of authorizationv1.ResourceRule, representing the set of actions
+ //     the user is allowed to perform. These typically come from a SubjectAccessReview
+ //     or SelfSubjectRulesReview.
++//   - requiredVerbs: A slice of verbs that the subject must have permission to perform.
+ //
+ // Return values:
+-//   - []resources.Resource: A slice of resources the user can delete. Each resource includes
++//   - []resources.Resource: A slice of resources the user can access with the required verbs. Each resource includes
+ //     its GroupVersionResource, GroupVersionKind, and scope (namespaced or cluster-wide).
+ //     The slice is sorted by the string representation of the resource.
+ //   - error: Returned if any GroupVersion string in the API resource list fails to parse.
+-func ComputeDeletableResources(
++func ComputeAuthorizedResources(
+ 	resourceLists []*metav1.APIResourceList,
+ 	rules []authorizationv1.ResourceRule,
++	requiredVerbs []string,
+ ) ([]resources.Resource, error) {
+ 	allowedResources := make(map[resources.Resource]struct{})
+ 
+@@ -169,7 +166,7 @@ func ComputeDeletableResources(
+ 				group = groupVersion.Group
+ 			}
+ 
+-			if !HasDeletePermission(group, apiResource, rules) {
++			if !HasPermissions(group, apiResource, rules, requiredVerbs) {
+ 				continue
+ 			}
+ 
+@@ -185,7 +182,6 @@ func ComputeDeletableResources(
+ 						Version: groupVersion.Version,
+ 						Kind:    apiResource.Kind,
+ 					},
+-					Scope: meta.RESTScopeNamespace,
+ 				},
+ 			}
+ 
+@@ -207,14 +203,14 @@ func ComputeDeletableResources(
+ 	return result, nil
+ }
+ 
+-// ListAuthorizedDeletableResources returns a list of Kubernetes resources that the current
+-// service account is authorized to delete within the specified namespace.
++// ListAuthorizedResources returns a list of Kubernetes resources that the current
++// service account is authorized to interact with (using the required verbs) within the specified namespace.
+ //
+-// It uses the discovery API to filter for resources that support the "delete" verb and
++// It uses the discovery API to filter for resources that support the required verbs and
+ // cross-references this list with the user's effective RBAC permissions.
+ //
+-// This prevents querying resources that do not support deletion or that the user does not have
+-// permission to delete, thereby avoiding unnecessary or unauthorized API calls (e.g., errors
++// This prevents querying resources that do not support the required verbs or that the user does not have
++// permission to use, thereby avoiding unnecessary or unauthorized API calls (e.g., errors
+ // like "MethodNotAllowed").
+ //
+ // Parameters:
+@@ -222,23 +218,25 @@ func ComputeDeletableResources(
+ //   - cli: A controller-runtime client used to make Kubernetes API calls.
+ //   - apis: A slice of APIResourceList, typically returned by discovery from the API server.
+ //   - namespace: The namespace in which to evaluate the user's permissions.
++//   - requiredVerbs: A slice of verbs that the subject must have permission to perform.
+ //
+ // Returns:
+-//   - []resources.Resource: A slice of deletable resources the user is authorized to delete,
++//   - []resources.Resource: A slice of resources the user is authorized to access with the required verbs,
+ //     including their GVK, GVR, and scope information.
+-//   - error: Non-nil if permission checks or deletable resource computation fails.
+-func ListAuthorizedDeletableResources(
++//   - error: Non-nil if permission checks or authorized resource computation fails.
++func ListAuthorizedResources(
+ 	ctx context.Context,
+ 	cli client.Client,
+ 	apis []*metav1.APIResourceList,
+ 	namespace string,
++	requiredVerbs []string,
+ ) ([]resources.Resource, error) {
+-	// We only take types that support the "delete" verb,
+-	// to prevents from performing queries that we know are going to
++	// We only take types that support the required verbs,
++	// to prevent performing queries that we know are going to
+ 	// return "MethodNotAllowed".
+ 	apiResourceLists := discovery.FilteredBy(
+ 		discovery.SupportsAllVerbs{
+-			Verbs: []string{VerbDelete},
++			Verbs: requiredVerbs,
+ 		},
+ 		apis,
+ 	)
+@@ -249,10 +247,10 @@ func ListAuthorizedDeletableResources(
+ 		return nil, fmt.Errorf("failure retrieving resource rules: %w", err)
+ 	}
+ 
+-	// Collect deletable resources.
+-	result, err := ComputeDeletableResources(apiResourceLists, items)
++	// Collect authorized resources.
++	result, err := ComputeAuthorizedResources(apiResourceLists, items, requiredVerbs)
+ 	if err != nil {
+-		return nil, fmt.Errorf("failure retrieving deletable resources: %w", err)
++		return nil, fmt.Errorf("failure retrieving authorized resources: %w", err)
+ 	}
+ 
+ 	return result, nil
+diff --git a/pkg/rules/rules_test.go b/pkg/rules/rules_test.go
+index 8d0c97515ffa..3c422020095d 100644
+--- a/pkg/rules/rules_test.go
++++ b/pkg/rules/rules_test.go
+@@ -36,6 +36,8 @@ func anyRule() authorizationv1.ResourceRule {
+ }
+ 
+ func TestMatchRules(t *testing.T) {
++	t.Parallel()
++
+ 	tests := []struct {
+ 		name          string
+ 		resourceGroup string
+@@ -95,6 +97,7 @@ func TestMatchRules(t *testing.T) {
+ 
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
++			t.Parallel()
+ 			g := NewWithT(t)
+ 
+ 			g.Expect(
+@@ -108,6 +111,110 @@ func TestMatchRules(t *testing.T) {
+ 	}
+ }
+ 
++func TestHasPermissions(t *testing.T) {
++	t.Parallel()
++
++	podResource := metav1.APIResource{Name: "pods", Namespaced: true, Kind: "Pod"}
++
++	cases := []struct {
++		name          string
++		rules         []authorizationv1.ResourceRule
++		requiredVerbs []string
++		want          bool
++	}{
++		{
++			name: "single verb granted",
++			rules: []authorizationv1.ResourceRule{{
++				Verbs:     []string{"delete"},
++				APIGroups: []string{""},
++				Resources: []string{"pods"},
++			}},
++			requiredVerbs: []string{"delete"},
++			want:          true,
++		},
++		{
++			name: "rule grants more verbs than required",
++			rules: []authorizationv1.ResourceRule{{
++				Verbs:     []string{"list", "delete", "update"},
++				APIGroups: []string{""},
++				Resources: []string{"pods"},
++			}},
++			requiredVerbs: []string{"delete"},
++			want:          true,
++		},
++		{
++			name: "single verb not granted",
++			rules: []authorizationv1.ResourceRule{{
++				Verbs:     []string{"list"},
++				APIGroups: []string{""},
++				Resources: []string{"pods"},
++			}},
++			requiredVerbs: []string{"delete"},
++			want:          false,
++		},
++		{
++			name: "multiple verbs all granted by one rule",
++			rules: []authorizationv1.ResourceRule{{
++				Verbs:     []string{"list", "delete"},
++				APIGroups: []string{""},
++				Resources: []string{"pods"},
++			}},
++			requiredVerbs: []string{"list", "delete"},
++			want:          true,
++		},
++		{
++			name: "multiple verbs only one granted",
++			rules: []authorizationv1.ResourceRule{{
++				Verbs:     []string{"list"},
++				APIGroups: []string{""},
++				Resources: []string{"pods"},
++			}},
++			requiredVerbs: []string{"list", "delete"},
++			want:          false,
++		},
++		{
++			name: "multiple verbs granted by separate rules",
++			rules: []authorizationv1.ResourceRule{
++				{Verbs: []string{"list"}, APIGroups: []string{""}, Resources: []string{"pods"}},
++				{Verbs: []string{"delete"}, APIGroups: []string{""}, Resources: []string{"pods"}},
++			},
++			requiredVerbs: []string{"list", "delete"},
++			want:          true,
++		},
++		{
++			name: "wildcard verb covers all required verbs",
++			rules: []authorizationv1.ResourceRule{{
++				Verbs:     []string{"*"},
++				APIGroups: []string{""},
++				Resources: []string{"pods"},
++			}},
++			requiredVerbs: []string{"list", "delete", "update"},
++			want:          true,
++		},
++		{
++			name:          "empty required verbs returns false",
++			rules:         []authorizationv1.ResourceRule{anyRule()},
++			requiredVerbs: []string{},
++			want:          false,
++		},
++		{
++			name:          "nil required verbs returns false",
++			rules:         []authorizationv1.ResourceRule{anyRule()},
++			requiredVerbs: nil,
++			want:          false,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			g := NewWithT(t)
++			got := rules.HasPermissions("", podResource, tc.rules, tc.requiredVerbs)
++			g.Expect(got).To(Equal(tc.want))
++		})
++	}
++}
++
+ func newTestResource(group string, version string, kind string, resource string) resources.Resource {
+ 	return resources.Resource{
+ 		RESTMapping: meta.RESTMapping{
+@@ -126,7 +233,7 @@ func newTestResource(group string, version string, kind string, resource string)
+ 	}
+ }
+ 
+-func TestListAuthorizedDeletableResources(t *testing.T) {
++func TestListAuthorizedResources(t *testing.T) {
+ 	const testNamespace = "test-namespace"
+ 
+ 	testCases := []struct {
+@@ -136,7 +243,7 @@ func TestListAuthorizedDeletableResources(t *testing.T) {
+ 		resourcesMatcher gTypes.GomegaMatcher
+ 	}{
+ 		{
+-			name: "successful retrieval of deletable resources",
++			name: "successful retrieval of authorized resources",
+ 			apis: []*metav1.APIResourceList{{
+ 				GroupVersion: "v1",
+ 				APIResources: []metav1.APIResource{
+@@ -162,7 +269,7 @@ func TestListAuthorizedDeletableResources(t *testing.T) {
+ 			),
+ 		},
+ 		{
+-			name: "successful filter of deletable resources",
++			name: "successful filter of authorized resources",
+ 			apis: []*metav1.APIResourceList{{
+ 				GroupVersion: "v1",
+ 				APIResources: []metav1.APIResource{
+@@ -187,7 +294,7 @@ func TestListAuthorizedDeletableResources(t *testing.T) {
+ 			),
+ 		},
+ 		{
+-			name: "no deletable resources by rule",
++			name: "no authorized resources by rule",
+ 			apis: []*metav1.APIResourceList{{
+ 				GroupVersion: "v1",
+ 				APIResources: []metav1.APIResource{
+@@ -202,7 +309,7 @@ func TestListAuthorizedDeletableResources(t *testing.T) {
+ 			resourcesMatcher: BeEmpty(),
+ 		},
+ 		{
+-			name: "no deletable resources",
++			name: "no authorized resources",
+ 			apis: []*metav1.APIResourceList{{
+ 				GroupVersion: "v1",
+ 				APIResources: []metav1.APIResource{
+@@ -253,7 +360,7 @@ func TestListAuthorizedDeletableResources(t *testing.T) {
+ 				}).
+ 				Build()
+ 
+-			items, err := rules.ListAuthorizedDeletableResources(ctx, cli, tc.apis, testNamespace)
++			items, err := rules.ListAuthorizedResources(ctx, cli, tc.apis, testNamespace, []string{rules.VerbDelete})
+ 
+ 			g.Expect(err).ShouldNot(HaveOccurred())
+ 			g.Expect(items).Should(tc.resourcesMatcher)
+diff --git a/tests/e2e/cloudmanager/cloudmanager_test.go b/tests/e2e/cloudmanager/cloudmanager_test.go
+index ddad52e84d7d..bc4136fa7189 100644
+--- a/tests/e2e/cloudmanager/cloudmanager_test.go
++++ b/tests/e2e/cloudmanager/cloudmanager_test.go
+@@ -43,7 +43,8 @@ func TestCloudManager_InvalidNameRejected(t *testing.T) {
+ //  2. ReadOnlyValidation  — status, labels, workload checks, self-healing
+ //  3. StatusAfterSpecChange — mutates spec but restores to all-Managed
+ //  4. UnmanagedNotReconciled — switches cert-manager to Unmanaged
+-//  5. GarbageCollectionOnDelete — deletes the CR (must be last)
++//  5. GarbageCollection — GC action: stale deletion, protected PKI, unmanaged transition
++//  6. CascadeDeletionOnCRDelete — Kubernetes cascade via ownerReferences (must be last)
+ func TestCloudManager(t *testing.T) { //nolint:maintidx // sequential subtests sharing one CR lifecycle are clearer inline
+ 	wt := tc.NewWithT(t)
+ 
+@@ -324,10 +325,129 @@ func TestCloudManager(t *testing.T) { //nolint:maintidx // sequential subtests s
+ 		}
+ 	})
+ 
+-	// --- 5. GarbageCollectionOnDelete ---
+-	// Deletes the CR and verifies all owned resources are cleaned up.
+-	// Must be the last test since it destroys the CR.
+-	t.Run("GarbageCollectionOnDelete", func(t *testing.T) {
++	// --- 5. GarbageCollection ---
++	// Tests the GC action that runs as the last step in the reconciliation pipeline.
++	// GC identifies stale or orphaned resources by comparing InstanceGeneration
++	// annotations and deletes them, while preserving protected PKI resources.
++	t.Run("GarbageCollection", func(t *testing.T) {
++		wt := tc.NewWithT(t)
++
++		// Restore all dependencies to Managed (step 4 left cert-manager Unmanaged).
++		wt.Patch(provider.GVK, k8sEngineCrNn(), func(obj *unstructured.Unstructured) error {
++			return unstructured.SetNestedField(obj.Object, allManaged(), "spec", "dependencies")
++		}).Eventually().Should(Not(BeNil()))
++
++		waitForReady(wt)
++		waitForDeploymentsAvailable(wt)
++
++		t.Run("PreservesProtectedPKIResources", func(t *testing.T) {
++			wt := tc.NewWithT(t)
++
++			// Trigger a spec change to force a full reconcile (render → deploy → GC).
++			wt.Patch(provider.GVK, k8sEngineCrNn(), func(obj *unstructured.Unstructured) error {
++				return unstructured.SetNestedField(obj.Object, string(ccmapi.Unmanaged),
++					"spec", "dependencies", "sailOperator", "managementPolicy")
++			}).Eventually().Should(Not(BeNil()))
++
++			wt.Get(provider.GVK, k8sEngineCrNn()).Eventually().Should(
++				jq.Match(`.status.observedGeneration == .metadata.generation`),
++			)
++
++			// PKI resources must survive the GC run.
++			wt.Get(gvk.CertManagerClusterIssuer, types.NamespacedName{
++				Name: "opendatahub-selfsigned-issuer",
++			}).Eventually().Should(Not(BeNil()))
++			wt.Get(gvk.CertManagerCertificate, types.NamespacedName{
++				Name: "opendatahub-ca", Namespace: "cert-manager",
++			}).Eventually().Should(Not(BeNil()))
++			wt.Get(gvk.CertManagerClusterIssuer, types.NamespacedName{
++				Name: "opendatahub-ca-issuer",
++			}).Eventually().Should(Not(BeNil()))
++
++			// Restore sailOperator.
++			wt.Patch(provider.GVK, k8sEngineCrNn(), func(obj *unstructured.Unstructured) error {
++				return unstructured.SetNestedField(obj.Object, string(ccmapi.Managed),
++					"spec", "dependencies", "sailOperator", "managementPolicy")
++			}).Eventually().Should(Not(BeNil()))
++		})
++
++		t.Run("DeletesStaleResources", func(t *testing.T) {
++			wt := tc.NewWithT(t)
++
++			cr := wt.Get(provider.GVK, k8sEngineCrNn()).Eventually().Should(Not(BeNil()))
++
++			// Create a ConfigMap that looks like a stale CCM resource: it has the
++			// infrastructure label and an owner reference, but its generation
++			// annotation does not match the CR's current generation.
++			staleCM := &unstructured.Unstructured{}
++			staleCM.SetGroupVersionKind(gvk.ConfigMap)
++			staleCM.SetName("stale-ccm-resource")
++			staleCM.SetNamespace("cert-manager-operator")
++			staleCM.SetLabels(map[string]string{
++				labels.InfrastructurePartOf: strings.ToLower(provider.GVK.Kind),
++			})
++			staleCM.SetAnnotations(map[string]string{
++				annotations.InstanceUID:        string(cr.GetUID()),
++				annotations.InstanceGeneration: "-1",
++			})
++			_ = unstructured.SetNestedSlice(staleCM.Object, []any{
++				map[string]any{
++					"apiVersion": provider.GVK.GroupVersion().String(),
++					"kind":       provider.GVK.Kind,
++					"name":       provider.InstanceName,
++					"uid":        string(cr.GetUID()),
++				},
++			}, "metadata", "ownerReferences")
++
++			wt.Expect(wt.Client().Create(wt.Context(), staleCM)).To(Succeed())
++			t.Cleanup(func() {
++				_ = wt.Client().Delete(wt.Context(), staleCM)
++			})
++
++			// Trigger a spec change to force a reconcile including GC.
++			wt.Patch(provider.GVK, k8sEngineCrNn(), func(obj *unstructured.Unstructured) error {
++				return unstructured.SetNestedField(obj.Object, string(ccmapi.Unmanaged),
++					"spec", "dependencies", "sailOperator", "managementPolicy")
++			}).Eventually().Should(Not(BeNil()))
++
++			// GC should delete the stale resource.
++			wt.Get(gvk.ConfigMap, client.ObjectKeyFromObject(staleCM)).Eventually().Should(BeNil())
++
++			// Restore sailOperator.
++			wt.Patch(provider.GVK, k8sEngineCrNn(), func(obj *unstructured.Unstructured) error {
++				return unstructured.SetNestedField(obj.Object, string(ccmapi.Managed),
++					"spec", "dependencies", "sailOperator", "managementPolicy")
++			}).Eventually().Should(Not(BeNil()))
++		})
++
++		t.Run("DeletesResourcesOnUnmanagedTransition", func(t *testing.T) {
++			wt := tc.NewWithT(t)
++
++			waitForReady(wt)
++
++			// Verify the cert-manager deployment exists before the transition.
++			certManagerDep := managedDependencyDeployments[0]
++			wt.Expect(certManagerDep.Name).To(ContainSubstring("cert-manager"))
++			nn := types.NamespacedName{Name: certManagerDep.Name, Namespace: certManagerDep.Namespace}
++			wt.Get(gvk.Deployment, nn).Eventually().Should(Not(BeNil()))
++
++			// Switch cert-manager to Unmanaged. Helm no longer renders cert-manager
++			// resources, so they retain stale generation annotations. GC deletes them.
++			wt.Patch(provider.GVK, k8sEngineCrNn(), func(obj *unstructured.Unstructured) error {
++				return unstructured.SetNestedField(obj.Object, string(ccmapi.Unmanaged),
++					"spec", "dependencies", "certManager", "managementPolicy")
++			}).Eventually().Should(Not(BeNil()))
++
++			// GC should automatically delete the cert-manager deployment.
++			wt.Get(gvk.Deployment, nn).Eventually().Should(BeNil())
++		})
++	})
++
++	// --- 6. CascadeDeletionOnCRDelete ---
++	// Deletes the CR and verifies Kubernetes cascade-deletes all owned resources
++	// (those with ownerReferences). Namespaces are excluded from ownership and
++	// survive deletion. Must be the last test since it destroys the CR.
++	t.Run("CascadeDeletionOnCRDelete", func(t *testing.T) {
+ 		wt := tc.NewWithT(t)
+ 
+ 		// Restore all dependencies to Managed (previous tests may have changed
+@@ -348,11 +468,13 @@ func TestCloudManager(t *testing.T) { //nolint:maintidx // sequential subtests s
+ 			)
+ 		}
+ 
+-		// Verify namespaces have owner references pointing to the CR.
++		// Namespaces are excluded from dynamic ownership to prevent cascade
++		// deletion of the entire namespace (and all third-party resources in it)
++		// when the CR is deleted. Verify they have no owner references.
+ 		for _, ns := range common.ManagedNamespaces() {
+ 			wt.Get(gvk.Namespace, types.NamespacedName{Name: ns}).
+ 				Eventually().Should(
+-				jq.Match(`.metadata.ownerReferences | length > 0`),
++				jq.Match(`.metadata.ownerReferences == null or (.metadata.ownerReferences | length == 0)`),
+ 			)
+ 		}
+ 
+@@ -360,17 +482,17 @@ func TestCloudManager(t *testing.T) { //nolint:maintidx // sequential subtests s
+ 		wt.Delete(provider.GVK, k8sEngineCrNn()).Eventually().Should(Succeed())
+ 		wt.Get(provider.GVK, k8sEngineCrNn()).Eventually().Should(BeNil())
+ 
+-		// All owned deployments should be garbage-collected.
++		// All owned deployments should be cascade-deleted via owner references.
+ 		for _, dep := range managedDependencyDeployments {
+ 			wt.Get(gvk.Deployment, types.NamespacedName{
+ 				Name: dep.Name, Namespace: dep.Namespace,
+ 			}).Eventually().Should(BeNil())
+ 		}
+ 
+-		// All owned namespaces should be garbage-collected.
++		// Namespaces survive CR deletion because they have no owner references.
+ 		for _, ns := range common.ManagedNamespaces() {
+ 			wt.Get(gvk.Namespace, types.NamespacedName{Name: ns}).
+-				Eventually().Should(BeNil())
++				Eventually().Should(Not(BeNil()))
+ 		}
+ 	})
+ }

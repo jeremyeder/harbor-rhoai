@@ -1,0 +1,26 @@
+schema_version = "1.1"
+
+[task]
+name = "odh/operator-pr-3128"
+description = "Add mutating admission webhook for automatic monitoring label injection on PodMonitor and ServiceMonitor resources"
+authors = [{ name = "Jeremy Eder", email = "jeder@redhat.com" }]
+
+[metadata]
+difficulty = "medium"
+category = "software-engineering"
+tags = ["go", "kubernetes", "operator", "opendatahub", "webhook", "monitoring"]
+source_pr = "https://github.com/opendatahub-io/opendatahub-operator/pull/3128"
+source_repo = "opendatahub-io/opendatahub-operator"
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 20480
+allow_internet = true
+
+[agent]
+timeout_sec = 1200.0
+
+[verifier]
+timeout_sec = 300.0

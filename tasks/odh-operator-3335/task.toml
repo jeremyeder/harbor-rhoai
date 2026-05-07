@@ -1,0 +1,26 @@
+schema_version = "1.1"
+
+[task]
+name = "odh/operator-pr-3335"
+description = "Fix DSC to report ComponentsReady=False when component CRs are stuck in deletion"
+authors = [{ name = "Jeremy Eder", email = "jeder@redhat.com" }]
+
+[metadata]
+difficulty = "hard"
+category = "software-engineering"
+tags = ["go", "kubernetes", "operator", "opendatahub", "status-reporting"]
+source_pr = "https://github.com/opendatahub-io/opendatahub-operator/pull/3335"
+source_repo = "opendatahub-io/opendatahub-operator"
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 20480
+allow_internet = true
+
+[agent]
+timeout_sec = 1200.0
+
+[verifier]
+timeout_sec = 300.0

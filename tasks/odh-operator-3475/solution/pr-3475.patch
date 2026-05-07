@@ -1,0 +1,1359 @@
+diff --git a/pkg/controller/actions/dependency/certmanager/bootstrap.go b/pkg/controller/actions/dependency/certmanager/bootstrap.go
+index 48d111cfcc56..c86802958102 100644
+--- a/pkg/controller/actions/dependency/certmanager/bootstrap.go
++++ b/pkg/controller/actions/dependency/certmanager/bootstrap.go
+@@ -24,6 +24,7 @@ import (
+ 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+ 	"k8s.io/apimachinery/pkg/api/meta"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
++	"k8s.io/apimachinery/pkg/runtime/schema"
+ 	"sigs.k8s.io/controller-runtime/pkg/client"
+ 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+ 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+@@ -33,8 +34,8 @@ import (
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions"
+-	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/dependency"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/handlers"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/precondition"
+ 	resourcespredicates "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/predicates/resources"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/reconciler"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
+@@ -45,13 +46,16 @@ import (
+ // No automatic renewal is configured; a renewal strategy is tracked as a follow-up.
+ const caRootDuration = "876000h"
+ 
+-// These CRD names must be covered consistently by MonitorCRDs and CRDPredicate.
+-// If a CRD is added here, update both functions.
+-const (
+-	certManagerCertificateCRD   = "certificates.cert-manager.io"
+-	certManagerIssuerCRD        = "issuers.cert-manager.io"
+-	certManagerClusterIssuerCRD = "clusterissuers.cert-manager.io"
+-)
++type monitoredCRD struct {
++	gvk          schema.GroupVersionKind
++	resourceName string
++}
++
++var monitoredCRDList = []monitoredCRD{
++	{gvk: gvk.CertManagerCertificate, resourceName: "certificates.cert-manager.io"},
++	{gvk: gvk.CertManagerIssuer, resourceName: "issuers.cert-manager.io"},
++	{gvk: gvk.CertManagerClusterIssuer, resourceName: "clusterissuers.cert-manager.io"},
++}
+ 
+ // DefaultIssuerRefKind is the default issuer reference kind used by downstream components.
+ const DefaultIssuerRefKind = "ClusterIssuer"
+@@ -363,26 +367,24 @@ func NewCleanupAction() actions.Fn {
+ 	}
+ }
+ 
+-// MonitorCRDs returns a dependency.ActionOpts that checks whether the three core cert-manager
+-// CRDs (Certificate, Issuer, ClusterIssuer) are registered on the cluster. If any CRD
+-// is absent, DependenciesAvailable is set to False.
+-func MonitorCRDs() dependency.ActionOpts {
+-	return dependency.Combine(
+-		dependency.MonitorCRD(dependency.CRDConfig{GVK: gvk.CertManagerCertificate}),
+-		dependency.MonitorCRD(dependency.CRDConfig{GVK: gvk.CertManagerIssuer}),
+-		dependency.MonitorCRD(dependency.CRDConfig{GVK: gvk.CertManagerClusterIssuer}),
+-	)
++func monitoredCRDs() []schema.GroupVersionKind {
++	gvks := make([]schema.GroupVersionKind, len(monitoredCRDList))
++	for i := range monitoredCRDList {
++		gvks[i] = monitoredCRDList[i].gvk
++	}
++
++	return gvks
+ }
+ 
+-// CRDPredicate returns a predicate that matches CustomResourceDefinition events for
+-// the three core cert-manager CRDs.
+-func CRDPredicate() predicate.Predicate {
++func crdPredicate() predicate.Predicate {
++	names := make(map[string]struct{}, len(monitoredCRDList))
++	for _, m := range monitoredCRDList {
++		names[m.resourceName] = struct{}{}
++	}
++
+ 	return predicate.NewPredicateFuncs(func(obj client.Object) bool {
+-		switch obj.GetName() {
+-		case certManagerCertificateCRD, certManagerIssuerCRD, certManagerClusterIssuerCRD:
+-			return true
+-		}
+-		return false
++		_, ok := names[obj.GetName()]
++		return ok
+ 	})
+ }
+ 
+@@ -392,7 +394,7 @@ func CRDPredicate() predicate.Predicate {
+ //   - a cert-manager CRDs watch to trigger reconciliation when cert-manager is installed,
+ //   - explicit watches for the PKI resource instances (ClusterIssuers, Certificate)
+ //     so the controller reconciles when they are modified or deleted,
+-//   - a monitoring action to set the DependenciesAvailable condition,
++//   - pre-conditions that monitor the three core cert-manager CRDs,
+ //   - a bootstrap action to deploy the PKI trust chain,
+ //   - a condition to set the DependenciesAvailable status.
+ //
+@@ -419,7 +421,7 @@ func Bootstrap[T common.PlatformObject](instanceName string, config BootstrapCon
+ 		b.Watches(
+ 			&extv1.CustomResourceDefinition{},
+ 			reconciler.WithEventHandler(handlers.ToNamed(instanceName)),
+-			reconciler.WithPredicates(CRDPredicate()),
++			reconciler.WithPredicates(crdPredicate()),
+ 		).
+ 			WatchesGVK(gvk.CertManagerClusterIssuer,
+ 				reconciler.WithEventHandler(handlers.ToNamed(instanceName)),
+@@ -439,7 +441,7 @@ func Bootstrap[T common.PlatformObject](instanceName string, config BootstrapCon
+ 				reconciler.WithPredicates(resourcespredicates.CreatedOrUpdatedOrDeletedNamed("cluster")),
+ 				reconciler.Dynamic(reconciler.CrdExists(gvk.CertManagerV1Alpha1)),
+ 			).
+-			WithAction(dependency.NewAction(MonitorCRDs())).
++			WithPreCondition(precondition.MonitorCRDs(monitoredCRDs())).
+ 			WithActionE(NewBootstrapAction(config)).
+ 			WithConditions(status.ConditionDependenciesAvailable).
+ 			WithFinalizer(NewCleanupAction())
+diff --git a/pkg/controller/actions/dependency/certmanager/monitor_test.go b/pkg/controller/actions/dependency/certmanager/monitor_test.go
+index 02bb3184eb8a..5e17f6068377 100644
+--- a/pkg/controller/actions/dependency/certmanager/monitor_test.go
++++ b/pkg/controller/actions/dependency/certmanager/monitor_test.go
+@@ -1,4 +1,5 @@
+-package certmanager_test
++//nolint:testpackage
++package certmanager
+ 
+ import (
+ 	"context"
+@@ -13,9 +14,8 @@ import (
+ 
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster/gvk"
+-	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/dependency"
+-	certmanager "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/dependency/certmanager"
+ 	cond "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/precondition"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/envt"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/scheme"
+@@ -23,10 +23,8 @@ import (
+ 	. "github.com/onsi/gomega"
+ )
+ 
+-// TestCRDPredicate verifies that CRDPredicate matches the three core cert-manager CRDs
+-// and rejects unrelated objects.
+ func TestCRDPredicate(t *testing.T) {
+-	pred := certmanager.CRDPredicate()
++	pred := crdPredicate()
+ 
+ 	makeCRD := func(name string) *unstructured.Unstructured {
+ 		u := &unstructured.Unstructured{}
+@@ -63,25 +61,22 @@ func TestCRDPredicate(t *testing.T) {
+ 	}
+ }
+ 
+-// TestMonitorCRDs verifies that MonitorCRDs pre-configures monitoring for the three core
+-// cert-manager CRDs.
+-//
+ // Each subtest uses its own envtest instance rather than sharing one across subtests.
+ // HasCRD relies on the REST mapper, whose discovery cache refreshes asynchronously after
+ // CRD deletion. A shared instance cannot guarantee the mapper reflects zero CRDs at the
+ // start of the "absent CRDs" case when other subtests registered CRDs beforehand.
+-func TestMonitorCRDs(t *testing.T) {
++func TestMonitoredCRDs(t *testing.T) {
+ 	tests := []struct {
+ 		name                   string
+ 		setupCRDs              func(t *testing.T, g *WithT, ctx context.Context, envTest *envt.EnvT)
+-		expectedAvailable      bool
++		expectedStatus         metav1.ConditionStatus
+ 		expectedMsgContains    []string
+ 		expectedMsgNotContains []string
+ 	}{
+ 		{
+-			name:              "absent CRDs yield degraded",
+-			setupCRDs:         nil,
+-			expectedAvailable: false,
++			name:           "absent CRDs yield failure",
++			setupCRDs:      nil,
++			expectedStatus: metav1.ConditionFalse,
+ 			expectedMsgContains: []string{
+ 				gvk.CertManagerCertificate.Kind,
+ 				gvk.CertManagerIssuer.Kind,
+@@ -89,25 +84,25 @@ func TestMonitorCRDs(t *testing.T) {
+ 			},
+ 		},
+ 		{
+-			name: "present CRDs yield healthy",
++			name: "present CRDs yield pass",
+ 			setupCRDs: func(t *testing.T, g *WithT, ctx context.Context, envTest *envt.EnvT) {
+ 				t.Helper()
+ 				_, err := envTest.RegisterCertManagerCRDs(ctx)
+ 				g.Expect(err).NotTo(HaveOccurred())
+ 			},
+-			expectedAvailable: true,
++			expectedStatus: metav1.ConditionTrue,
+ 		},
+ 		{
+ 			name: "mix of present and absent CRDs",
+ 			setupCRDs: func(t *testing.T, g *WithT, ctx context.Context, envTest *envt.EnvT) {
+ 				t.Helper()
++				// Issuer and ClusterIssuer CRDs intentionally not registered
+ 				_, err := envTest.RegisterCRD(ctx, gvk.CertManagerCertificate, "certificates", "certificate", apiextensionsv1.NamespaceScoped)
+ 				g.Expect(err).NotTo(HaveOccurred())
+-				// Issuer and ClusterIssuer CRDs intentionally not registered
+ 			},
+-			expectedAvailable:      false,
++			expectedStatus:         metav1.ConditionFalse,
+ 			expectedMsgContains:    []string{gvk.CertManagerIssuer.Kind, gvk.CertManagerClusterIssuer.Kind},
+-			expectedMsgNotContains: []string{gvk.CertManagerCertificate.Kind + ": CRD not found"},
++			expectedMsgNotContains: []string{gvk.CertManagerCertificate.Kind},
+ 		},
+ 	}
+ 
+@@ -120,33 +115,35 @@ func TestMonitorCRDs(t *testing.T) {
+ 			t.Cleanup(func() { _ = envTest.Stop() })
+ 
+ 			ctx := context.Background()
+-			cli := envTest.Client()
+ 
+ 			if tt.setupCRDs != nil {
+ 				tt.setupCRDs(t, g, ctx, envTest)
+ 			}
+ 
++			gvks := monitoredCRDs()
++			g.Expect(gvks).To(HaveLen(3))
++			g.Expect(gvks).To(ContainElements(
++				gvk.CertManagerCertificate,
++				gvk.CertManagerIssuer,
++				gvk.CertManagerClusterIssuer,
++			))
++
+ 			instance := &scheme.TestPlatformObject{ObjectMeta: metav1.ObjectMeta{Name: xid.New().String()}}
+-			condManager := cond.NewManager(instance, status.ConditionDependenciesAvailable)
+-			rr := &types.ReconciliationRequest{Client: cli, Instance: instance, Conditions: condManager}
++			condManager := cond.NewManager(instance, status.ConditionTypeReady, status.ConditionDependenciesAvailable)
++			rr := &types.ReconciliationRequest{Client: envTest.Client(), Instance: instance, Conditions: condManager}
+ 
+-			action := dependency.NewAction(certmanager.MonitorCRDs())
+-			err = action(ctx, rr)
+-			g.Expect(err).NotTo(HaveOccurred())
++			pcs := []precondition.PreCondition{precondition.MonitorCRDs(gvks)}
++			precondition.RunAll(ctx, rr, pcs)
++
++			got := condManager.GetCondition(status.ConditionDependenciesAvailable)
++			g.Expect(got).NotTo(BeNil())
++			g.Expect(got.Status).To(Equal(tt.expectedStatus))
+ 
+-			gotCond := condManager.GetCondition(status.ConditionDependenciesAvailable)
+-			g.Expect(gotCond).NotTo(BeNil())
+-
+-			if tt.expectedAvailable {
+-				g.Expect(gotCond.Status).To(Equal(metav1.ConditionTrue))
+-			} else {
+-				g.Expect(gotCond.Status).To(Equal(metav1.ConditionFalse))
+-				for _, s := range tt.expectedMsgContains {
+-					g.Expect(gotCond.Message).To(ContainSubstring(s))
+-				}
+-				for _, s := range tt.expectedMsgNotContains {
+-					g.Expect(gotCond.Message).NotTo(ContainSubstring(s))
+-				}
++			for _, s := range tt.expectedMsgContains {
++				g.Expect(got.Message).To(ContainSubstring(s))
++			}
++			for _, s := range tt.expectedMsgNotContains {
++				g.Expect(got.Message).NotTo(ContainSubstring(s))
+ 			}
+ 		})
+ 	}
+diff --git a/pkg/controller/precondition/monitor_crd.go b/pkg/controller/precondition/monitor_crd.go
+new file mode 100644
+index 000000000000..1ee1502edef1
+--- /dev/null
++++ b/pkg/controller/precondition/monitor_crd.go
+@@ -0,0 +1,50 @@
++package precondition
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"slices"
++	"strings"
++
++	"k8s.io/apimachinery/pkg/runtime/schema"
++
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++)
++
++func MonitorCRD(gvk schema.GroupVersionKind, opts ...Option) PreCondition {
++	return MonitorCRDs([]schema.GroupVersionKind{gvk}, opts...)
++}
++
++// MonitorCRDs creates a PreCondition that checks for the presence of multiple CRDs.
++// All CRDs are checked and absent ones are reported together in a single failure message.
++// The first API error encountered is returned immediately.
++func MonitorCRDs(gvks []schema.GroupVersionKind, opts ...Option) PreCondition {
++	monitoredGVKs := slices.Clone(gvks)
++
++	return newPreCondition(func(ctx context.Context, rr *types.ReconciliationRequest) (CheckResult, error) {
++		if len(monitoredGVKs) == 0 {
++			return CheckResult{}, errors.New("MonitorCRDs called with empty GVK list")
++		}
++
++		var missing []string
++
++		for _, gvk := range monitoredGVKs {
++			has, err := cluster.HasCRD(ctx, rr.Client, gvk)
++			if err != nil {
++				return CheckResult{}, fmt.Errorf("%s: failed to check CRD presence: %w", gvk.Kind, err)
++			}
++
++			if !has {
++				missing = append(missing, gvk.Kind+": CRD not found")
++			}
++		}
++
++		if len(missing) > 0 {
++			return CheckResult{Pass: false, Message: strings.Join(missing, "; ")}, nil
++		}
++
++		return CheckResult{Pass: true}, nil
++	}, opts...)
++}
+diff --git a/pkg/controller/precondition/monitor_crd_test.go b/pkg/controller/precondition/monitor_crd_test.go
+new file mode 100644
+index 000000000000..0dfdebac2a3d
+--- /dev/null
++++ b/pkg/controller/precondition/monitor_crd_test.go
+@@ -0,0 +1,200 @@
++//nolint:testpackage
++package precondition
++
++import (
++	"context"
++	"testing"
++
++	"github.com/rs/xid"
++	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/runtime/schema"
++
++	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
++	cond "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/envt"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/scheme"
++
++	. "github.com/onsi/gomega"
++)
++
++var testCRDGVK = schema.GroupVersionKind{
++	Group:   "testprecondition.opendatahub.io",
++	Version: "v1",
++	Kind:    "TestPreConditionResource",
++}
++
++var testCRDGVK2 = schema.GroupVersionKind{
++	Group:   "testprecondition.opendatahub.io",
++	Version: "v1",
++	Kind:    "TestPreConditionResource2",
++}
++
++func TestMonitorCRD_Present(t *testing.T) {
++	g := NewWithT(t)
++	ctx := context.Background()
++
++	envTest, err := envt.New()
++	g.Expect(err).NotTo(HaveOccurred())
++	t.Cleanup(func() { _ = envTest.Stop() })
++
++	cli := envTest.Client()
++
++	crd, err := envTest.RegisterCRD(ctx, testCRDGVK, "testpreconditionresources", "testpreconditionresource", apiextensionsv1.ClusterScoped)
++	g.Expect(err).NotTo(HaveOccurred())
++	envt.CleanupDelete(t, g, ctx, cli, crd)
++
++	rr := &types.ReconciliationRequest{Client: cli}
++
++	t.Run("MonitorCRD", func(t *testing.T) {
++		g := NewWithT(t)
++		pc := MonitorCRD(testCRDGVK)
++		result, err := pc.check(ctx, rr)
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(result.Pass).To(BeTrue())
++	})
++
++	t.Run("MonitorCRDs", func(t *testing.T) {
++		g := NewWithT(t)
++		pc := MonitorCRDs([]schema.GroupVersionKind{testCRDGVK})
++		result, err := pc.check(ctx, rr)
++		g.Expect(err).NotTo(HaveOccurred())
++		g.Expect(result.Pass).To(BeTrue())
++	})
++}
++
++func TestMonitorCRDs_AllPresent(t *testing.T) {
++	g := NewWithT(t)
++	ctx := context.Background()
++
++	envTest, err := envt.New()
++	g.Expect(err).NotTo(HaveOccurred())
++	t.Cleanup(func() { _ = envTest.Stop() })
++
++	cli := envTest.Client()
++
++	crd1, err := envTest.RegisterCRD(ctx, testCRDGVK, "testpreconditionresources", "testpreconditionresource", apiextensionsv1.ClusterScoped)
++	g.Expect(err).NotTo(HaveOccurred())
++	envt.CleanupDelete(t, g, ctx, cli, crd1)
++
++	crd2, err := envTest.RegisterCRD(ctx, testCRDGVK2, "testpreconditionresource2s", "testpreconditionresource2", apiextensionsv1.ClusterScoped)
++	g.Expect(err).NotTo(HaveOccurred())
++	envt.CleanupDelete(t, g, ctx, cli, crd2)
++
++	rr := &types.ReconciliationRequest{Client: cli}
++
++	pc := MonitorCRDs([]schema.GroupVersionKind{testCRDGVK, testCRDGVK2})
++	result, err := pc.check(ctx, rr)
++	g.Expect(err).NotTo(HaveOccurred())
++	g.Expect(result.Pass).To(BeTrue())
++}
++
++func TestMonitorCRD_Absent(t *testing.T) {
++	g := NewWithT(t)
++	ctx := context.Background()
++
++	envTest, err := envt.New()
++	g.Expect(err).NotTo(HaveOccurred())
++	t.Cleanup(func() { _ = envTest.Stop() })
++
++	absentGVK := schema.GroupVersionKind{
++		Group:   "absent.opendatahub.io",
++		Version: "v1",
++		Kind:    "AbsentResource",
++	}
++
++	pc := MonitorCRD(absentGVK)
++	result, err := pc.check(ctx, &types.ReconciliationRequest{Client: envTest.Client()})
++
++	g.Expect(err).NotTo(HaveOccurred())
++	g.Expect(result.Pass).To(BeFalse())
++	g.Expect(result.Message).To(ContainSubstring("AbsentResource"))
++	g.Expect(result.Message).To(ContainSubstring("CRD not found"))
++}
++
++func TestMonitorCRDs_SomeAbsent(t *testing.T) {
++	g := NewWithT(t)
++	ctx := context.Background()
++
++	envTest, err := envt.New()
++	g.Expect(err).NotTo(HaveOccurred())
++	t.Cleanup(func() { _ = envTest.Stop() })
++
++	cli := envTest.Client()
++
++	crd, err := envTest.RegisterCRD(ctx, testCRDGVK, "testpreconditionresources", "testpreconditionresource", apiextensionsv1.ClusterScoped)
++	g.Expect(err).NotTo(HaveOccurred())
++	envt.CleanupDelete(t, g, ctx, cli, crd)
++
++	absentGVK := schema.GroupVersionKind{
++		Group:   "absent.opendatahub.io",
++		Version: "v1",
++		Kind:    "AbsentResource",
++	}
++
++	pc := MonitorCRDs([]schema.GroupVersionKind{testCRDGVK, absentGVK})
++	result, err := pc.check(ctx, &types.ReconciliationRequest{Client: cli})
++
++	g.Expect(err).NotTo(HaveOccurred())
++	g.Expect(result.Pass).To(BeFalse())
++	g.Expect(result.Message).To(ContainSubstring("AbsentResource"))
++	g.Expect(result.Message).NotTo(ContainSubstring("TestPreConditionResource"))
++}
++
++func TestMonitorCRDs_EmptySlice(t *testing.T) {
++	g := NewWithT(t)
++	ctx := context.Background()
++
++	envTest, err := envt.New()
++	g.Expect(err).NotTo(HaveOccurred())
++	t.Cleanup(func() { _ = envTest.Stop() })
++
++	rr := &types.ReconciliationRequest{Client: envTest.Client()}
++
++	pc := MonitorCRDs(nil)
++	result, checkErr := pc.check(ctx, rr)
++
++	g.Expect(checkErr).To(HaveOccurred())
++	g.Expect(checkErr.Error()).To(ContainSubstring("empty GVK list"))
++	g.Expect(result.Pass).To(BeFalse())
++}
++
++func TestMonitorCRD_IntegrationWithRunAll(t *testing.T) {
++	g := NewWithT(t)
++	ctx := context.Background()
++
++	envTest, err := envt.New()
++	g.Expect(err).NotTo(HaveOccurred())
++	t.Cleanup(func() { _ = envTest.Stop() })
++
++	cli := envTest.Client()
++
++	crd, err := envTest.RegisterCRD(ctx, testCRDGVK, "testpreconditionresources", "testpreconditionresource", apiextensionsv1.ClusterScoped)
++	g.Expect(err).NotTo(HaveOccurred())
++	envt.CleanupDelete(t, g, ctx, cli, crd)
++
++	absentGVK := schema.GroupVersionKind{
++		Group:   "absent.opendatahub.io",
++		Version: "v1",
++		Kind:    "AbsentResource",
++	}
++
++	instance := &scheme.TestPlatformObject{ObjectMeta: metav1.ObjectMeta{Name: xid.New().String()}}
++	condManager := cond.NewManager(instance, status.ConditionTypeReady, status.ConditionDependenciesAvailable)
++	rr := &types.ReconciliationRequest{Client: cli, Instance: instance, Conditions: condManager}
++
++	pcs := []PreCondition{
++		MonitorCRD(testCRDGVK),
++		MonitorCRD(absentGVK),
++	}
++
++	shouldStop := RunAll(ctx, rr, pcs)
++	g.Expect(shouldStop).To(BeFalse())
++
++	got := condManager.GetCondition(status.ConditionDependenciesAvailable)
++	g.Expect(got).NotTo(BeNil())
++	g.Expect(got.Status).To(Equal(metav1.ConditionFalse))
++	g.Expect(got.Message).To(ContainSubstring("AbsentResource"))
++	g.Expect(got.Message).NotTo(ContainSubstring("TestPreConditionResource"))
++}
+diff --git a/pkg/controller/precondition/precondition.go b/pkg/controller/precondition/precondition.go
+new file mode 100644
+index 000000000000..11088e7fc666
+--- /dev/null
++++ b/pkg/controller/precondition/precondition.go
+@@ -0,0 +1,201 @@
++package precondition
++
++import (
++	"context"
++	"slices"
++	"strings"
++
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	ctrlLog "sigs.k8s.io/controller-runtime/pkg/log"
++
++	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
++	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster"
++	cond "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++)
++
++const PreConditionFailedReason = "PreConditionFailed"
++
++// CheckResult holds the outcome of a check execution.
++type CheckResult struct {
++	Pass    bool
++	Message string
++}
++
++// CheckFunc is the function signature for a pre-reconciliation check.
++type CheckFunc func(ctx context.Context, rr *types.ReconciliationRequest) (CheckResult, error)
++
++type Option func(*PreCondition)
++
++// PreCondition composes a Check with framework configuration that controls
++// how RunAll aggregates and writes Kubernetes status conditions.
++type PreCondition struct {
++	check              CheckFunc
++	conditionType      string
++	severity           common.ConditionSeverity
++	stopReconciliation bool
++	clusterTypes       []string
++	message            string
++}
++
++// WithConditionType sets the condition type that will be written.
++// Empty strings are ignored to preserve the constructor default.
++func WithConditionType(t string) Option {
++	return func(pc *PreCondition) {
++		if t != "" {
++			pc.conditionType = t
++		}
++	}
++}
++
++// WithSeverity sets the severity of the condition that will be written.
++func WithSeverity(s common.ConditionSeverity) Option {
++	return func(pc *PreCondition) {
++		pc.severity = s
++	}
++}
++
++// WithStopReconciliation flags the reconciliation to be stopped if the precondition is not met.
++func WithStopReconciliation() Option {
++	return func(pc *PreCondition) {
++		pc.stopReconciliation = true
++	}
++}
++
++// WithClusterTypes sets the cluster types on which the precondition will be checked.
++func WithClusterTypes(types ...string) Option {
++	return func(pc *PreCondition) {
++		pc.clusterTypes = slices.Clone(types)
++	}
++}
++
++// WithMessage sets the message that will be written to the condition.
++func WithMessage(msg string) Option {
++	return func(pc *PreCondition) {
++		pc.message = msg
++	}
++}
++
++func newPreCondition(check CheckFunc, opts ...Option) PreCondition {
++	pc := PreCondition{
++		check:         check,
++		conditionType: status.ConditionDependenciesAvailable,
++		severity:      common.ConditionSeverityError,
++	}
++
++	for _, opt := range opts {
++		opt(&pc)
++	}
++
++	return pc
++}
++
++// conditionAggregate aggregates the check results for a given condition type.
++type conditionAggregate struct {
++	status     metav1.ConditionStatus
++	severity   common.ConditionSeverity
++	messages   []string
++	shouldStop bool
++}
++
++// Priority: False > Unknown > True.
++func (agg *conditionAggregate) record(s metav1.ConditionStatus, message string, pc *PreCondition) {
++	switch {
++	case s == metav1.ConditionFalse:
++		agg.status = metav1.ConditionFalse
++	case s == metav1.ConditionUnknown && agg.status != metav1.ConditionFalse:
++		agg.status = metav1.ConditionUnknown
++	}
++
++	agg.messages = append(agg.messages, message)
++
++	if pc.severity == common.ConditionSeverityError {
++		agg.severity = common.ConditionSeverityError
++	}
++
++	if pc.stopReconciliation {
++		agg.shouldStop = true
++	}
++}
++
++// RunAll runs all the preconditions and returns true when the reconciliation should be stopped.
++func RunAll(ctx context.Context, rr *types.ReconciliationRequest, preConditions []PreCondition) bool {
++	if len(preConditions) == 0 {
++		return false
++	}
++
++	l := ctrlLog.FromContext(ctx)
++	clusterType := cluster.GetClusterInfo().Type
++	results := make(map[string]*conditionAggregate)
++
++	for i := range preConditions {
++		pc := &preConditions[i]
++
++		// Skip preconditions that don't apply to this cluster type.
++		if len(pc.clusterTypes) > 0 && !slices.Contains(pc.clusterTypes, clusterType) {
++			continue
++		}
++
++		// Initialize the condition aggregate for this condition type.
++		if results[pc.conditionType] == nil {
++			results[pc.conditionType] = &conditionAggregate{
++				status:   metav1.ConditionTrue,
++				severity: common.ConditionSeverityInfo,
++			}
++		}
++		agg := results[pc.conditionType]
++
++		if pc.check == nil {
++			l.Info("Pre-condition check function is nil", "conditionType", pc.conditionType)
++			agg.record(metav1.ConditionUnknown, "precondition check function is nil", pc)
++
++			continue
++		}
++
++		// Run the precondition check.
++		result, err := pc.check(ctx, rr)
++		if err != nil {
++			l.Info("Pre-condition check error", "conditionType", pc.conditionType, "error", err.Error())
++			agg.record(metav1.ConditionUnknown, err.Error(), pc)
++
++			continue
++		}
++
++		if !result.Pass {
++			l.Info("Pre-condition not met", "conditionType", pc.conditionType, "message", result.Message)
++
++			msg := result.Message
++			if pc.message != "" {
++				msg = pc.message
++			}
++
++			agg.record(metav1.ConditionFalse, msg, pc)
++		}
++	}
++
++	// Write aggregated results to conditions.
++	shouldStop := false
++
++	for ct, agg := range results {
++		opts := []cond.Option{
++			cond.WithObservedGeneration(rr.Instance.GetGeneration()),
++		}
++
++		if agg.status != metav1.ConditionTrue {
++			opts = append(opts,
++				cond.WithReason(PreConditionFailedReason),
++				cond.WithSeverity(agg.severity),
++				cond.WithMessage("%s", strings.Join(agg.messages, "; ")),
++			)
++		}
++
++		rr.Conditions.Mark(ct, agg.status, opts...)
++
++		if agg.shouldStop {
++			shouldStop = true
++		}
++	}
++
++	return shouldStop
++}
+diff --git a/pkg/controller/precondition/precondition_test.go b/pkg/controller/precondition/precondition_test.go
+new file mode 100644
+index 000000000000..b5e9094a5cdf
+--- /dev/null
++++ b/pkg/controller/precondition/precondition_test.go
+@@ -0,0 +1,411 @@
++//nolint:testpackage
++package precondition
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/rs/xid"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++
++	"github.com/opendatahub-io/opendatahub-operator/v2/api/common"
++	"github.com/opendatahub-io/opendatahub-operator/v2/internal/controller/status"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/cluster"
++	cond "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/utils/test/scheme"
++
++	. "github.com/onsi/gomega"
++)
++
++var errTest = errors.New("test error")
++
++func passingCheck(_ context.Context, _ *types.ReconciliationRequest) (CheckResult, error) {
++	return CheckResult{Pass: true}, nil
++}
++
++func failingCheck(msg string) CheckFunc {
++	return func(_ context.Context, _ *types.ReconciliationRequest) (CheckResult, error) {
++		return CheckResult{Pass: false, Message: msg}, nil
++	}
++}
++
++func errorCheck(_ context.Context, _ *types.ReconciliationRequest) (CheckResult, error) {
++	return CheckResult{}, errTest
++}
++
++func newRR(conditionTypes ...string) *types.ReconciliationRequest {
++	instance := &scheme.TestPlatformObject{ObjectMeta: metav1.ObjectMeta{Name: xid.New().String()}}
++
++	return &types.ReconciliationRequest{
++		Instance:   instance,
++		Conditions: cond.NewManager(instance, status.ConditionTypeReady, conditionTypes...),
++	}
++}
++
++func Test_newPreCondition_Defaults(t *testing.T) {
++	g := NewWithT(t)
++
++	pc := newPreCondition(passingCheck)
++
++	g.Expect(pc.check).NotTo(BeNil())
++	g.Expect(pc.conditionType).To(Equal(status.ConditionDependenciesAvailable))
++	g.Expect(pc.severity).To(Equal(common.ConditionSeverityError))
++	g.Expect(pc.stopReconciliation).To(BeFalse())
++	g.Expect(pc.clusterTypes).To(BeNil())
++	g.Expect(pc.message).To(BeEmpty())
++}
++
++func Test_newPreCondition_Options(t *testing.T) {
++	tests := []struct {
++		name   string
++		opt    Option
++		assert func(g Gomega, pc PreCondition)
++	}{
++		{
++			name: "WithConditionType sets condition type",
++			opt:  WithConditionType("CustomCondition"),
++			assert: func(g Gomega, pc PreCondition) {
++				g.Expect(pc.conditionType).To(Equal("CustomCondition"))
++			},
++		},
++		{
++			name: "WithConditionType empty string preserves default",
++			opt:  WithConditionType(""),
++			assert: func(g Gomega, pc PreCondition) {
++				g.Expect(pc.conditionType).To(Equal(status.ConditionDependenciesAvailable))
++			},
++		},
++		{
++			name: "WithSeverity",
++			opt:  WithSeverity(common.ConditionSeverityInfo),
++			assert: func(g Gomega, pc PreCondition) {
++				g.Expect(pc.severity).To(Equal(common.ConditionSeverityInfo))
++			},
++		},
++		{
++			name: "WithStopReconciliation",
++			opt:  WithStopReconciliation(),
++			assert: func(g Gomega, pc PreCondition) {
++				g.Expect(pc.stopReconciliation).To(BeTrue())
++			},
++		},
++		{
++			name: "WithClusterTypes",
++			opt:  WithClusterTypes(cluster.ClusterTypeOpenShift, cluster.ClusterTypeKubernetes),
++			assert: func(g Gomega, pc PreCondition) {
++				g.Expect(pc.clusterTypes).To(Equal([]string{cluster.ClusterTypeOpenShift, cluster.ClusterTypeKubernetes}))
++			},
++		},
++		{
++			name: "WithMessage",
++			opt:  WithMessage("custom message"),
++			assert: func(g Gomega, pc PreCondition) {
++				g.Expect(pc.message).To(Equal("custom message"))
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			g := NewWithT(t)
++			pc := newPreCondition(passingCheck, tt.opt)
++			tt.assert(g, pc)
++		})
++	}
++}
++
++func Test_newPreCondition_MultipleOptions(t *testing.T) {
++	g := NewWithT(t)
++
++	pc := newPreCondition(
++		passingCheck,
++		WithConditionType("Custom"),
++		WithSeverity(common.ConditionSeverityInfo),
++		WithStopReconciliation(),
++		WithClusterTypes(cluster.ClusterTypeOpenShift),
++		WithMessage("guidance"),
++	)
++
++	g.Expect(pc.conditionType).To(Equal("Custom"))
++	g.Expect(pc.severity).To(Equal(common.ConditionSeverityInfo))
++	g.Expect(pc.stopReconciliation).To(BeTrue())
++	g.Expect(pc.clusterTypes).To(Equal([]string{cluster.ClusterTypeOpenShift}))
++	g.Expect(pc.message).To(Equal("guidance"))
++}
++
++func TestRunAll(t *testing.T) {
++	tests := []struct {
++		name                   string
++		preConditions          []PreCondition
++		generation             int64
++		expectedShouldStop     bool
++		expectedStatus         metav1.ConditionStatus
++		expectedReason         string
++		expectedSeverity       common.ConditionSeverity
++		expectedMsgContains    []string
++		expectedMsgNotContains []string
++	}{
++		{
++			name:               "all pass",
++			preConditions:      []PreCondition{newPreCondition(passingCheck), newPreCondition(passingCheck)},
++			expectedShouldStop: false,
++			expectedStatus:     metav1.ConditionTrue,
++		},
++		{
++			name:                "one fails without stop",
++			preConditions:       []PreCondition{newPreCondition(passingCheck), newPreCondition(failingCheck("CRD missing"))},
++			generation:          5,
++			expectedShouldStop:  false,
++			expectedStatus:      metav1.ConditionFalse,
++			expectedReason:      PreConditionFailedReason,
++			expectedMsgContains: []string{"CRD missing"},
++		},
++		{
++			name:               "one fails with stop",
++			preConditions:      []PreCondition{newPreCondition(passingCheck), newPreCondition(failingCheck("CRD missing"), WithStopReconciliation())},
++			expectedShouldStop: true,
++			expectedStatus:     metav1.ConditionFalse,
++		},
++		{
++			name:                "check error yields Unknown",
++			preConditions:       []PreCondition{newPreCondition(errorCheck)},
++			expectedShouldStop:  false,
++			expectedStatus:      metav1.ConditionUnknown,
++			expectedReason:      PreConditionFailedReason,
++			expectedSeverity:    common.ConditionSeverityError,
++			expectedMsgContains: []string{"test error"},
++		},
++		{
++			name:               "check error with stop",
++			preConditions:      []PreCondition{newPreCondition(errorCheck, WithStopReconciliation())},
++			expectedShouldStop: true,
++			expectedStatus:     metav1.ConditionUnknown,
++		},
++		{
++			name:               "mixed Unknown and Failed, False wins",
++			preConditions:      []PreCondition{newPreCondition(failingCheck("CRD missing")), newPreCondition(errorCheck)},
++			expectedShouldStop: false,
++			expectedStatus:     metav1.ConditionFalse,
++		},
++		{
++			name:                "aggregates messages from multiple failures",
++			preConditions:       []PreCondition{newPreCondition(failingCheck("CRD A missing")), newPreCondition(failingCheck("CRD B missing"))},
++			expectedShouldStop:  false,
++			expectedStatus:      metav1.ConditionFalse,
++			expectedMsgContains: []string{"CRD A missing", "CRD B missing"},
++		},
++		{
++			name: "severity aggregation: Error if any Error",
++			preConditions: []PreCondition{
++				newPreCondition(failingCheck("info dep"), WithSeverity(common.ConditionSeverityInfo)),
++				newPreCondition(failingCheck("error dep")),
++			},
++			expectedShouldStop: false,
++			expectedStatus:     metav1.ConditionFalse,
++			expectedSeverity:   common.ConditionSeverityError,
++		},
++		{
++			name: "severity aggregation: Info if all Info",
++			preConditions: []PreCondition{
++				newPreCondition(failingCheck("info dep 1"), WithSeverity(common.ConditionSeverityInfo)),
++				newPreCondition(failingCheck("info dep 2"), WithSeverity(common.ConditionSeverityInfo)),
++			},
++			expectedShouldStop: false,
++			expectedStatus:     metav1.ConditionFalse,
++			expectedSeverity:   common.ConditionSeverityInfo,
++		},
++		{
++			name:                   "custom message overrides check result",
++			preConditions:          []PreCondition{newPreCondition(failingCheck("original msg"), WithMessage("custom guidance"))},
++			expectedShouldStop:     false,
++			expectedStatus:         metav1.ConditionFalse,
++			expectedMsgContains:    []string{"custom guidance"},
++			expectedMsgNotContains: []string{"original msg"},
++		},
++		{
++			name: "nil check honors severity and stop",
++			preConditions: []PreCondition{
++				newPreCondition(nil, WithSeverity(common.ConditionSeverityError), WithStopReconciliation()),
++			},
++			expectedShouldStop:  true,
++			expectedStatus:      metav1.ConditionUnknown,
++			expectedSeverity:    common.ConditionSeverityError,
++			expectedMsgContains: []string{"precondition check function is nil"},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			g := NewWithT(t)
++
++			rr := newRR(status.ConditionDependenciesAvailable)
++			if tt.generation > 0 {
++				rr.Instance.SetGeneration(tt.generation)
++			}
++
++			shouldStop := RunAll(t.Context(), rr, tt.preConditions)
++			g.Expect(shouldStop).To(Equal(tt.expectedShouldStop))
++
++			got := rr.Conditions.GetCondition(status.ConditionDependenciesAvailable)
++			g.Expect(got).NotTo(BeNil())
++			g.Expect(got.Status).To(Equal(tt.expectedStatus))
++
++			if tt.expectedStatus == metav1.ConditionTrue {
++				g.Expect(got.Reason).To(BeEmpty())
++				g.Expect(got.Message).To(BeEmpty())
++			}
++
++			if tt.expectedReason != "" {
++				g.Expect(got.Reason).To(Equal(tt.expectedReason))
++			}
++			if tt.expectedSeverity != "" {
++				g.Expect(got.Severity).To(Equal(tt.expectedSeverity))
++			}
++			for _, s := range tt.expectedMsgContains {
++				g.Expect(got.Message).To(ContainSubstring(s))
++			}
++			for _, s := range tt.expectedMsgNotContains {
++				g.Expect(got.Message).NotTo(ContainSubstring(s))
++			}
++			if tt.generation > 0 {
++				g.Expect(got.ObservedGeneration).To(Equal(tt.generation))
++			}
++		})
++	}
++}
++
++func TestRunAll_EmptyList(t *testing.T) {
++	g := NewWithT(t)
++
++	rr := newRR()
++	shouldStop := RunAll(t.Context(), rr, nil)
++
++	g.Expect(shouldStop).To(BeFalse())
++}
++
++func TestRunAll_ClusterTypeFiltering(t *testing.T) {
++	g := NewWithT(t)
++
++	cluster.SetClusterInfo(cluster.ClusterInfo{Type: cluster.ClusterTypeOpenShift})
++	t.Cleanup(func() { cluster.SetClusterInfo(cluster.ClusterInfo{}) })
++
++	rr := newRR(status.ConditionDependenciesAvailable)
++	pcs := []PreCondition{
++		newPreCondition(
++			failingCheck("k8s only check"),
++			WithClusterTypes(cluster.ClusterTypeKubernetes),
++			WithStopReconciliation(),
++		),
++	}
++
++	shouldStop := RunAll(t.Context(), rr, pcs)
++
++	g.Expect(shouldStop).To(BeFalse())
++	got := rr.Conditions.GetCondition(status.ConditionDependenciesAvailable)
++	g.Expect(got).NotTo(BeNil())
++	g.Expect(got.Status).NotTo(Equal(metav1.ConditionFalse))
++}
++
++func TestRunAll_MultipleConditionTypes(t *testing.T) {
++	g := NewWithT(t)
++
++	customCondition := "CustomDeps"
++	rr := newRR(status.ConditionDependenciesAvailable, customCondition)
++
++	pcs := []PreCondition{
++		newPreCondition(passingCheck),
++		newPreCondition(failingCheck("custom failed"), WithConditionType(customCondition)),
++	}
++
++	RunAll(t.Context(), rr, pcs)
++
++	defaultCond := rr.Conditions.GetCondition(status.ConditionDependenciesAvailable)
++	g.Expect(defaultCond).NotTo(BeNil())
++	g.Expect(defaultCond.Status).To(Equal(metav1.ConditionTrue))
++
++	customCond := rr.Conditions.GetCondition(customCondition)
++	g.Expect(customCond).NotTo(BeNil())
++	g.Expect(customCond.Status).To(Equal(metav1.ConditionFalse))
++	g.Expect(customCond.Message).To(ContainSubstring("custom failed"))
++}
++
++func TestRunAll_AllPreconditionsRunEvenWhenSomeFail(t *testing.T) {
++	g := NewWithT(t)
++
++	callCount := 0
++	countingCheck := CheckFunc(func(_ context.Context, _ *types.ReconciliationRequest) (CheckResult, error) {
++		callCount++
++		return CheckResult{Pass: false, Message: "fail"}, nil
++	})
++
++	rr := newRR(status.ConditionDependenciesAvailable)
++	pcs := []PreCondition{
++		newPreCondition(countingCheck, WithStopReconciliation()),
++		newPreCondition(countingCheck, WithStopReconciliation()),
++		newPreCondition(countingCheck, WithStopReconciliation()),
++	}
++
++	RunAll(t.Context(), rr, pcs)
++
++	g.Expect(callCount).To(Equal(3))
++}
++
++func TestRecord_StatusPriority(t *testing.T) {
++	pc := &PreCondition{severity: common.ConditionSeverityError}
++
++	tests := []struct {
++		name           string
++		sequence       []metav1.ConditionStatus
++		expectedStatus metav1.ConditionStatus
++	}{
++		{
++			name:           "False wins over Unknown",
++			sequence:       []metav1.ConditionStatus{metav1.ConditionUnknown, metav1.ConditionFalse},
++			expectedStatus: metav1.ConditionFalse,
++		},
++		{
++			name:           "False wins over True",
++			sequence:       []metav1.ConditionStatus{metav1.ConditionTrue, metav1.ConditionFalse},
++			expectedStatus: metav1.ConditionFalse,
++		},
++		{
++			name:           "Unknown wins over True",
++			sequence:       []metav1.ConditionStatus{metav1.ConditionTrue, metav1.ConditionUnknown},
++			expectedStatus: metav1.ConditionUnknown,
++		},
++		{
++			name:           "Unknown not downgraded by True",
++			sequence:       []metav1.ConditionStatus{metav1.ConditionUnknown, metav1.ConditionTrue},
++			expectedStatus: metav1.ConditionUnknown,
++		},
++		{
++			name:           "False not downgraded by Unknown",
++			sequence:       []metav1.ConditionStatus{metav1.ConditionFalse, metav1.ConditionUnknown},
++			expectedStatus: metav1.ConditionFalse,
++		},
++		{
++			name:           "False not downgraded by True",
++			sequence:       []metav1.ConditionStatus{metav1.ConditionFalse, metav1.ConditionTrue},
++			expectedStatus: metav1.ConditionFalse,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			g := NewWithT(t)
++
++			agg := &conditionAggregate{
++				status:   metav1.ConditionTrue,
++				severity: common.ConditionSeverityInfo,
++			}
++
++			for _, s := range tt.sequence {
++				agg.record(s, "msg", pc)
++			}
++
++			g.Expect(agg.status).To(Equal(tt.expectedStatus))
++		})
++	}
++}
+diff --git a/pkg/controller/reconciler/reconciler.go b/pkg/controller/reconciler/reconciler.go
+index 7b03a471c6a9..6be551807f64 100644
+--- a/pkg/controller/reconciler/reconciler.go
++++ b/pkg/controller/reconciler/reconciler.go
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions"
+ 	odherrors "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/errors"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/precondition"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/resources"
+ )
+@@ -92,6 +93,7 @@ type Reconciler struct {
+ 	ManifestsBasePath string
+ 
+ 	name                        string
++	preConditions               []precondition.PreCondition
+ 	instanceFactory             func() (common.PlatformObject, error)
+ 	conditionsManagerFactory    func(common.ConditionsAccessor) *conditions.Manager
+ 	gvks                        map[schema.GroupVersionKind]gvkInfo
+@@ -346,35 +348,48 @@ func (r *Reconciler) apply(ctx context.Context, res common.PlatformObject) error
+ 
+ 	rr.Conditions.Reset()
+ 
+-	var provisionErr error
+-
+-	// Execute actions sequentially. Stop on first error and mark conditions accordingly.
+-	for _, action := range r.Actions {
+-		l.Info("Executing action", "action", action)
++	// Check if all the preconditions are met. If not, flag to stop the reconciliation.
++	shouldStop := precondition.RunAll(ctx, &rr, r.preConditions)
+ 
+-		actx := log.IntoContext(
+-			ctx,
+-			l.WithName(actions.ActionGroup).WithName(action.String()),
+-		)
++	var provisionErr error
+ 
+-		provisionErr = action(actx, &rr)
+-		if provisionErr != nil {
+-			break
+-		}
+-	}
++	if shouldStop {
++		l.Info("Preconditions not met, stopping reconciliation")
+ 
+-	// Set provisioning condition based on action execution result
+-	if provisionErr != nil {
+ 		rr.Conditions.MarkFalse(
+ 			status.ConditionTypeProvisioningSucceeded,
+-			conditions.WithError(provisionErr),
++			conditions.WithReason(precondition.PreConditionFailedReason),
++			conditions.WithMessage("pre-conditions not met, see status conditions for details"),
+ 			conditions.WithObservedGeneration(rr.Instance.GetGeneration()),
+ 		)
+ 	} else {
+-		rr.Conditions.MarkTrue(
+-			status.ConditionTypeProvisioningSucceeded,
+-			conditions.WithObservedGeneration(rr.Instance.GetGeneration()),
+-		)
++		// Execute actions sequentially. Stop on first error and mark conditions accordingly.
++		for _, action := range r.Actions {
++			l.Info("Executing action", "action", action)
++
++			actx := log.IntoContext(
++				ctx,
++				l.WithName(actions.ActionGroup).WithName(action.String()),
++			)
++
++			provisionErr = action(actx, &rr)
++			if provisionErr != nil {
++				break
++			}
++		}
++
++		if provisionErr != nil {
++			rr.Conditions.MarkFalse(
++				status.ConditionTypeProvisioningSucceeded,
++				conditions.WithError(provisionErr),
++				conditions.WithObservedGeneration(rr.Instance.GetGeneration()),
++			)
++		} else {
++			rr.Conditions.MarkTrue(
++				status.ConditionTypeProvisioningSucceeded,
++				conditions.WithObservedGeneration(rr.Instance.GetGeneration()),
++			)
++		}
+ 	}
+ 
+ 	is := rr.Instance.GetStatus()
+diff --git a/pkg/controller/reconciler/reconciler_support.go b/pkg/controller/reconciler/reconciler_support.go
+index 4a72606a5fb4..26a4ab1ae432 100644
+--- a/pkg/controller/reconciler/reconciler_support.go
++++ b/pkg/controller/reconciler/reconciler_support.go
+@@ -24,6 +24,7 @@ import (
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/dynamicownership"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/handlers"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/precondition"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/predicates"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/predicates/component"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
+@@ -113,6 +114,7 @@ type ReconcilerBuilder[T common.PlatformObject] struct {
+ 	watches                  []watchInput
+ 	predicates               []predicate.Predicate
+ 	instanceName             string
++	preConditions            []precondition.PreCondition
+ 	actions                  []actions.Fn
+ 	finalizers               []actions.Fn
+ 	errors                   error
+@@ -156,6 +158,12 @@ func (b *ReconcilerBuilder[T]) WithConditions(dependents ...string) *ReconcilerB
+ 	return b
+ }
+ 
++func (b *ReconcilerBuilder[T]) WithPreCondition(pc precondition.PreCondition) *ReconcilerBuilder[T] {
++	b.preConditions = append(b.preConditions, pc)
++
++	return b
++}
++
+ func (b *ReconcilerBuilder[T]) WithInstanceName(instanceName string) *ReconcilerBuilder[T] {
+ 	b.instanceName = instanceName
+ 	return b
+@@ -455,6 +463,8 @@ func (b *ReconcilerBuilder[T]) Build(_ context.Context) (*Reconciler, error) {
+ 		c = c.WithEventFilter(b.predicates[i])
+ 	}
+ 
++	r.preConditions = append(r.preConditions, b.preConditions...)
++
+ 	for i := range b.actions {
+ 		r.AddAction(b.actions[i])
+ 	}
+diff --git a/pkg/controller/reconciler/reconciler_test.go b/pkg/controller/reconciler/reconciler_test.go
+index 16e8b3b041eb..0b00b0f5755b 100644
+--- a/pkg/controller/reconciler/reconciler_test.go
++++ b/pkg/controller/reconciler/reconciler_test.go
+@@ -42,6 +42,7 @@ import (
+ 	odherrors "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/errors"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/actions/gc"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/conditions"
++	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/precondition"
+ 	odhtype "github.com/opendatahub-io/opendatahub-operator/v2/pkg/controller/types"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/metadata/annotations"
+ 	"github.com/opendatahub-io/opendatahub-operator/v2/pkg/resources"
+@@ -223,6 +224,62 @@ func TestConditions(t *testing.T) {
+ 	}
+ }
+ 
++func TestPreConditions_StopReconciliation(t *testing.T) {
++	ctx := t.Context()
++
++	g := NewWithT(t)
++
++	et, err := envt.New()
++	g.Expect(err).NotTo(HaveOccurred())
++	t.Cleanup(func() { _ = et.Stop() })
++
++	cli := et.Client()
++
++	dash := resources.GvkToUnstructured(gvk.Dashboard)
++	dash.SetName(componentApi.DashboardInstanceName)
++	dash.SetGeneration(1)
++
++	err = cli.Create(ctx, dash)
++	g.Expect(err).NotTo(HaveOccurred())
++	t.Cleanup(func() {
++		_ = cli.Delete(ctx, dash, client.PropagationPolicy(metav1.DeletePropagationBackground))
++	})
++
++	actionExecuted := false
++
++	cc := createReconciler(cli)
++	cc.preConditions = []precondition.PreCondition{
++		precondition.MonitorCRD(
++			schema.GroupVersionKind{Group: "fake.opendatahub.io", Version: "v1", Kind: "FakeResource"},
++			precondition.WithStopReconciliation(),
++		),
++	}
++	cc.AddAction(func(_ context.Context, _ *odhtype.ReconciliationRequest) error {
++		actionExecuted = true
++		return nil
++	})
++
++	result, err := cc.Reconcile(ctx, ctrl.Request{
++		NamespacedName: types.NamespacedName{Name: componentApi.DashboardInstanceName},
++	})
++
++	g.Expect(err).ShouldNot(HaveOccurred())
++	g.Expect(result.RequeueAfter).Should(BeZero())
++	g.Expect(actionExecuted).To(BeFalse())
++
++	di := resources.GvkToUnstructured(gvk.Dashboard)
++	di.SetName(componentApi.DashboardInstanceName)
++
++	err = cli.Get(ctx, client.ObjectKeyFromObject(di), di)
++	g.Expect(err).ShouldNot(HaveOccurred())
++
++	g.Expect(di).Should(And(
++		jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, status.ConditionTypeReady, metav1.ConditionFalse),
++		jq.Match(`.status.conditions[] | select(.type == "%s") | .status == "%s"`, status.ConditionTypeProvisioningSucceeded, metav1.ConditionFalse),
++		jq.Match(`.status.conditions[] | select(.type == "%s") | .reason == "%s"`, status.ConditionTypeProvisioningSucceeded, "PreConditionFailed"),
++	))
++}
++
+ // TestReconcilerBuilder_WatchMethods_UseUnstructured verifies that all watch
+ // registration methods (Owns, Watches, OwnsGVK, WatchesGVK) convert objects
+ // to unstructured. This prevents the stale cache bug where typed and
