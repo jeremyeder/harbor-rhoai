@@ -11,3 +11,6 @@ RUN git clone https://github.com/opendatahub-io/opendatahub-operator.git . && \
     git checkout 115ed0a225131c6d1e23ad09c2aa347862dbf20f
 
 RUN go mod download
+
+RUN go install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest && \
+    setup-envtest use --bin-dir /usr/local/kubebuilder/bin
