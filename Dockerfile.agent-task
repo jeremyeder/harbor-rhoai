@@ -8,4 +8,9 @@ RUN npm install -g @anthropic-ai/claude-code
 
 USER 1001
 
+COPY --chown=1001:1001 instruction.md /app/instruction.md
+COPY --chown=1001:1001 tests/ /tests/
+RUN chmod +x /tests/test.sh
+
 ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+ENV HOME=/tmp

@@ -2,7 +2,7 @@ name: harbor-agent-3290
 experiment:
   name: harbor-rhoai
 model:
-  url: "https://api.anthropic.com"
+  url: "https://us-east5-aiplatform.googleapis.com"
   name: claude-sonnet-4-6
 benchmarks:
   - id: harbor-task
@@ -16,3 +16,11 @@ benchmarks:
       timeout_sec: 1200
       cpu: "4"
       memory: "8Gi"
+      env_from_secrets:
+        - gcp-vertex-sa
+      secret_volumes:
+        - secret_name: gcp-vertex-sa
+          mount_path: /secrets/gcp
+          items:
+            - key: sa-key.json
+              path: sa-key.json

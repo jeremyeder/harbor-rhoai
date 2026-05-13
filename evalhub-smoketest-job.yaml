@@ -1,0 +1,16 @@
+name: harbor-k8s-3290
+experiment:
+  name: harbor-rhoai
+model:
+  url: "local"
+  name: oracle
+benchmarks:
+  - id: harbor-task
+    provider_id: harbor-bench
+    parameters:
+      task_path: tasks/odh-operator-3290
+      task_image: image-registry.openshift-image-registry.svc:5000/evalhub/harbor-task-3290:oracle
+      execution_mode: kubernetes
+      agent: oracle
+      namespace: evalhub
+      timeout_sec: 600
