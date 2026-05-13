@@ -1,0 +1,9 @@
+TestComputeKustomizeVariable
+TestComputeKustomizeVariableEmptyDomain
+TestComputeKustomizeVariableError
+TestComputeKustomizeVariableInvalidDomain
+TestComputeKustomizeVariableUnknownPlatformFallback
+TestGetName
+TestIsEnabled
+TestNewCRObject
+TestUpdateDSCStatus
