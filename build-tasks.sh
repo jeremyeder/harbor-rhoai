@@ -111,6 +111,20 @@ for task in "${TASKS[@]}"; do
         docker push "${oracle_image}" || FAILED+=("${task}:push-oracle")
     fi
 
+    if [ -f "Dockerfile.agent-task" ]; then
+        agent_image="${REGISTRY}/${NAMESPACE}/harbor-task-${task}:agent"
+        echo "  Agent image: ${agent_image}"
+        if ! docker build --provenance=false --sbom=false --platform "${PLATFORM}" \
+            --build-arg "BASE_IMAGE=${base_image}" \
+            -t "${agent_image}" \
+            -f Dockerfile.agent-task "${task_dir}/"; then
+            echo "  WARNING: agent image build failed (non-fatal)"
+        elif [ "${PUSH}" = "true" ]; then
+            echo "  Pushing ${agent_image}..."
+            docker push "${agent_image}" || echo "  WARNING: agent image push failed"
+        fi
+    fi
+
     echo "  Done: ${task}"
     echo ""
 done

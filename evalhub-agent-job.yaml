@@ -1,0 +1,18 @@
+name: harbor-agent-3290
+experiment:
+  name: harbor-rhoai
+model:
+  url: "https://api.anthropic.com"
+  name: claude-sonnet-4-6
+benchmarks:
+  - id: harbor-task
+    provider_id: harbor-bench
+    parameters:
+      task_path: tasks/odh-operator-3290
+      task_image: image-registry.openshift-image-registry.svc:5000/evalhub/harbor-task-3290:agent
+      execution_mode: kubernetes
+      agent: claude-code
+      namespace: evalhub
+      timeout_sec: 1200
+      cpu: "4"
+      memory: "8Gi"

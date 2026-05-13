@@ -1,0 +1,11 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER 0
+
+RUN microdnf install -y nodejs npm && microdnf clean all
+RUN npm install -g @anthropic-ai/claude-code
+
+USER 1001
+
+ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
