@@ -3,8 +3,10 @@ FROM ${BASE_IMAGE}
 
 USER 0
 
-RUN microdnf install -y nodejs npm && microdnf clean all
+RUN microdnf install -y nodejs npm python3.12 python3.12-pip && microdnf clean all
 RUN npm install -g @anthropic-ai/claude-code
+RUN python3.12 -m pip install --no-cache-dir "mlflow>=3.10"
+RUN ln -sf /usr/bin/python3.12 /usr/local/bin/python3
 
 USER 1001
 
@@ -12,5 +14,6 @@ COPY --chown=1001:1001 instruction.md /app/instruction.md
 COPY --chown=1001:1001 tests/ /tests/
 RUN chmod +x /tests/test.sh
 
-ENV CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 ENV HOME=/tmp
+ENV DISABLE_AUTOUPDATER=1
+ENV DISABLE_ERROR_REPORTING=1
