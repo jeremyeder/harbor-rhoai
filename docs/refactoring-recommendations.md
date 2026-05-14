@@ -14,16 +14,6 @@ Pod logs are read by the adapter but only the `HARBOR_REWARD=` line is extracted
 
 The `run_task_job()` return already includes `stdout` — the adapter just doesn't save it.
 
-### Partial reward scoring
-
-`test.sh` gives reward=1 (all pass) or reward=0 (any failure). A partial reward would be far more informative for model comparison. For example:
-
-- Regression tests pass: +0.5
-- New test functions found: +0.25
-- New tests pass: +0.25
-
-Or: `reward = (tests_passed / tests_total)` across both stages. This lets you see that Model A got 0.8 and Model B got 0.3, instead of both getting 0.
-
 ## P2 — Important
 
 ### Centralize cluster config
@@ -36,10 +26,7 @@ Images use only `:latest`, `:oracle`, `:agent` tags. No way to roll back or corr
 
 ### Slim down agent image
 
-The agent image installs the full `mlflow` package (~200+ deps) just for one Stop hook function. Options:
-- Use `mlflow[skinny]` (fewer deps, still has the hooks module — verify)
-- Extract just `mlflow.claude_code.hooks` and its transitive imports as a vendored module
-- Accept the size and move on (it only affects build time, not runtime)
+The agent image installs the full `mlflow` package (~200+ deps) for the Claude Code Stop hook. `mlflow-skinny` does NOT include `mlflow.claude_code`, so full mlflow is required in the agent image. The provider image can use `mlflow-skinny` for artifact logging.
 
 ## P3 — Nice to Have
 
@@ -62,12 +49,18 @@ The oc token-based docker login expires silently after ~24h. `build-tasks.sh` pr
 
 | # | Issue | Priority | Impact | Effort |
 |---|-------|----------|--------|--------|
+| # | Issue | Priority | Impact | Effort |
 | 2 | Secret/ConfigMap manifests | P1 | Reproducibility | Low |
 | 9 | Capture test output in MLflow | P1 | Debuggability | Low |
-| 8 | Partial reward scoring | P1 | Benchmark quality | Medium |
 | 1 | Centralize cluster config | P2 | Maintainability | Low |
 | 5 | Image versioning | P2 | Reproducibility | Low |
 | 4 | Slim down agent image | P2 | Build speed | Medium |
 | 7 | Templatize agent script | P3 | Code quality | Medium |
 | 6 | Integrate provider build | P3 | DX | Medium |
 | 10 | Docker login check | P3 | Robustness | Low |
+
+## Deferred
+
+### Partial reward scoring
+
+`test.sh` gives reward=1 or reward=0. A partial reward (e.g., `tests_passed / tests_total`) would be more informative for model comparison. Tracked as AEH bead.
