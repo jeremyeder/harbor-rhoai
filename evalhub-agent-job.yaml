@@ -18,6 +18,8 @@ benchmarks:
       memory: "8Gi"
       env_from_secrets:
         - gcp-vertex-sa
+      env_from_configmaps:
+        - claude-otel-config
       secret_volumes:
         - secret_name: gcp-vertex-sa
           mount_path: /secrets/gcp
