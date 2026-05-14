@@ -49,7 +49,6 @@ The oc token-based docker login expires silently after ~24h. `build-tasks.sh` pr
 
 | # | Issue | Priority | Impact | Effort |
 |---|-------|----------|--------|--------|
-| # | Issue | Priority | Impact | Effort |
 | 2 | Secret/ConfigMap manifests | P1 | Reproducibility | Low |
 | 9 | Capture test output in MLflow | P1 | Debuggability | Low |
 | 1 | Centralize cluster config | P2 | Maintainability | Low |
