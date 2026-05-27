@@ -1,0 +1,6 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+COPY --chown=1001:1001 solution/ /solution/
+COPY --chown=1001:1001 tests/ /tests/
+RUN chmod +x /solution/solve.sh /tests/test.sh

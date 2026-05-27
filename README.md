@@ -4,7 +4,7 @@ Harbor benchmark dataset for evaluating agentic coding on real-world Red Hat Ope
 
 ## Overview
 
-5 tasks derived from merged PRs in [opendatahub-io/opendatahub-operator](https://github.com/opendatahub-io/opendatahub-operator). Each task presents the codebase at the state just before the PR was merged, with instructions describing what needs to be built or fixed.
+3 tasks derived from merged PRs in [opendatahub-io/opendatahub-operator](https://github.com/opendatahub-io/opendatahub-operator). Each task presents the codebase at the state just before the PR was merged, with instructions describing what needs to be built or fixed.
 
 Designed for measuring **value-per-token (VPT)** — the ratio of evaluation score to tokens consumed — across different coding agents and models.
 
@@ -12,8 +12,6 @@ Designed for measuring **value-per-token (VPT)** — the ratio of evaluation sco
 
 | Task | Source PR | Difficulty | Lines | Description |
 |------|-----------|------------|-------|-------------|
-| `odh-operator-3335` | [#3335](https://github.com/opendatahub-io/opendatahub-operator/pull/3335) | Hard | 1,419 | Fix ComponentsReady status during CR deletion |
-| `odh-operator-3128` | [#3128](https://github.com/opendatahub-io/opendatahub-operator/pull/3128) | Medium | 1,889 | Add monitoring label injector mutation webhook |
 | `odh-operator-3475` | [#3475](https://github.com/opendatahub-io/opendatahub-operator/pull/3475) | Medium | 1,117 | Add WithPreCondition to reconciler builder |
 | `odh-operator-3343` | [#3343](https://github.com/opendatahub-io/opendatahub-operator/pull/3343) | Medium | 895 | Report failed ImageStream tag imports |
 | `odh-operator-3290` | [#3290](https://github.com/opendatahub-io/opendatahub-operator/pull/3290) | Medium | 1,255 | Wire GC action into CCM pipeline |
@@ -22,10 +20,10 @@ Designed for measuring **value-per-token (VPT)** — the ratio of evaluation sco
 
 ```bash
 # Run a single task with the oracle (solution) agent
-harbor run -p tasks/odh-operator-3335 -a oracle
+harbor run -p tasks/odh-operator-3290 -a oracle
 
 # Run with a real agent
-harbor run -p tasks/odh-operator-3335 -a claude-code -m anthropic/claude-sonnet-4-6
+harbor run -p tasks/odh-operator-3290 -a claude-code -m anthropic/claude-sonnet-4-6
 
 # Run all tasks
 harbor run -p tasks/ -a claude-code -m anthropic/claude-sonnet-4-6

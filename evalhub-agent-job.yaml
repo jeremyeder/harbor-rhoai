@@ -1,0 +1,28 @@
+name: harbor-agent-3290
+experiment:
+  name: harbor-rhoai
+model:
+  url: "https://us-east5-aiplatform.googleapis.com"
+  name: claude-sonnet-4-6
+benchmarks:
+  - id: harbor-task
+    provider_id: harbor-bench
+    parameters:
+      task_path: tasks/odh-operator-3290
+      task_image: image-registry.openshift-image-registry.svc:5000/evalhub/harbor-task-odh-operator-3290:agent
+      execution_mode: kubernetes
+      agent: claude-code
+      namespace: evalhub
+      timeout_sec: 7200
+      cpu: "4"
+      memory: "8Gi"
+      env_from_secrets:
+        - gcp-vertex-sa
+      env_from_configmaps:
+        - claude-otel-config
+      secret_volumes:
+        - secret_name: gcp-vertex-sa
+          mount_path: /secrets/gcp
+          items:
+            - key: sa-key.json
+              path: sa-key.json

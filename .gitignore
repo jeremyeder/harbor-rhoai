@@ -1,0 +1,11 @@
+jobs/
+.DS_Store
+.claude/mlflow/
+docs/plans/
+docs/superpowers/
+stop-hook/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
