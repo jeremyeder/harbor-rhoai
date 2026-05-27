@@ -1,161 +1,145 @@
-# Session Handoff: harbor-rhoai
+# Session Handoff: harbor-rhoai → agent-eval-harness
 
-**Date:** 2026-05-13
+**Date:** 2026-05-27
 **Author:** Claude Code (Opus 4.6)
 
 ## Summary
 
-Extended Harbor/EvalHub integration with real agent support (Claude Code via Vertex AI), secret volume mounts, and agent mode validation. Filed 2 upstream EvalHub bugs. CodeRabbit review clean. Ready for commits and PRs.
+This session was a strategic pivot. Started with cleanup of harbor-rhoai uncommitted changes, discovered that `rhai-datasets` supersedes harbor-rhoai's task authoring, reviewed agent-eval-harness PR #30 (merged EvalHub provider), filed 6 bugs from the review, then shifted focus entirely to agent-eval-harness for the **Model Picker** initiative: sweeping model/config variants across RFE Creator skill evaluations, scoring against a baseline, and comparing in MLflow dashboards.
 
-## Uncommitted Changes
+## Key Decision
 
-### harbor-rhoai (`fix/session-gaps` branch)
+**harbor-rhoai is being archived.** Its roles are split:
+- **Task generation** → `rhai-datasets` (already has harbor factory)
+- **Build/runtime infra** → `agent-eval-harness` (future migration)
+- **3 worked-example tasks** → `rhai-datasets/examples/` (future migration)
+
+**The real work is now in agent-eval-harness.** Next session should `cd ~/repos/agent-eval-harness`.
+
+## What Was Done This Session
+
+1. Reviewed harbor-rhoai uncommitted changes (README, handoff, cluster-changes.md, .gitignore)
+2. Updated .gitignore to exclude local artifacts — **NOT YET COMMITTED**
+3. Reviewed [PR #30](https://github.com/opendatahub-io/agent-eval-harness/pull/30) (already merged, approved by @astefanutti)
+4. Created 6 bug-fix beads in agent-eval-harness from PR #30 review
+5. Created 6 future-work beads for the Model Picker initiative
+6. Read the [Model Picker Google Doc](https://docs.google.com/document/d/1CgSJeIgXE9w3bVMq46BDL2-w1uUVPkB1ORJt46eNCgw) — full factorial sweep matrix (6 axes, 15+ configs)
+7. Read [agentskills.io eval docs](https://agentskills.io/skill-creation/evaluating-skills) — with/without skill comparison pattern, marketplace concepts
+
+## Uncommitted Changes (harbor-rhoai)
 
 | File | Change |
 |---|---|
-| `Dockerfile.agent-task` | Copies instruction.md + tests/ (not solution/), sets HOME=/tmp for writable config |
-| `evalhub-agent-job.yaml` | Vertex AI URL, env_from_secrets + secret_volumes for gcp-vertex-sa |
-| `docs/execution-flow-comparison.md` | NEW — Mermaid diagrams comparing Harbor native vs K8s runner flows |
-| `docs/evalhub-issues-draft.md` | NEW — Draft text for filed upstream issues |
+| `.gitignore` | Added .DS_Store, .claude/mlflow/, docs/plans/, docs/superpowers/, stop-hook/ |
+| `README.md` | Fixed task count 5→3, removed deleted tasks, updated examples |
+| `handoff.md` | This file |
+| `docs/cluster-changes.md` | NEW — cluster setup runbook for jeder-evalhub (decided to commit) |
 
-5 prior commits on branch (from previous session), 2 files uncommitted.
+## Beads Created (agent-eval-harness)
 
-### agent-eval-harness (`feat/harbor-provider` branch)
+### PR #30 Bug Fixes
 
-Worktree: `~/repos/agent-eval-harness/.claude/worktrees/feat+harbor-provider/`
+| ID | P | Title |
+|---|---|---|
+| SWP-9cu | P1 | Add timeout protection to direct LLM mode |
+| SWP-lcj | P2 | Fix aggregate exit code logic in EvalHub adapter |
+| SWP-atg | P2 | Surface judge scoring failures in results |
+| SWP-g25 | P2 | Handle non-text LLM response content blocks |
+| SWP-l6z | P3 | Validate case inputs upfront before execution loop |
+| SWP-m4z | P3 | Prevent judge metric name collisions with built-in metrics |
 
-| File | Change |
-|---|---|
-| `agent_eval/harbor/k8s_runner.py` | Agent mode (_oracle_script/_agent_script), secret volume mounts (_build_volumes), agent validation, shlex.quote for model, malformed reward handling |
-| `agent_eval/harbor/adapter.py` | Passes agent/model/secret_volumes to runner, mean_reward None warning |
-| `tests/test_harbor_adapter.py` | 9 new tests: TestAgentMode (5), TestSecretVolumes (4) — 33 total, all passing |
-| `pyproject.toml` | Added `harbor` optional dependency group |
+### Model Picker Initiative
 
-6 prior commits on branch (from previous session), 4 files uncommitted.
+| ID | P | Title |
+|---|---|---|
+| SWP-bf7 | P1 | Run baseline RFE Creator eval through EvalHub |
+| SWP-yrg | P2 | Design skill marketplace packaging abstraction |
+| SWP-0li | P2 | Build sweep orchestrator for parametric model evaluation |
+| SWP-xp1 | P3 | Add multi-runner support for non-Claude LLMs |
+| SWP-kho | P3 | Add with/without skill comparison mode |
+| SWP-nim | P3 | Build comparative scorecard from MLflow sweep results |
 
-## Upstream Issues Filed
+## Next Session: Get the Baseline Run (SWP-bf7)
 
-- **eval-hub/eval-hub#574** — Sidecar image hardcoded as unqualified `eval-runtime-sidecar:latest`
-- **eval-hub/eval-hub#575** — `providers list` crashes on empty `pass_criteria`
+**Repo:** `~/repos/agent-eval-harness` (main branch, PR #30 already merged)
 
-## Open Beads
+**Goal:** Run RFE Creator eval through EvalHub on jeder-evalhub cluster, get scored results in MLflow. This is the prerequisite for all sweep/comparison work.
 
-| Bead | P | Status | Title |
-|---|---|---|---|
-| AEH-khe | P1 | open | PR harbor-rhoai and agent-eval-harness harbor provider changes |
-| AEH-7m2 | P1 | open | EvalHub EA2 hardcodes unqualified sidecar image (filed as #574) |
-| AEH-l5k | P2 | open | EvalHub providers list crashes (filed as #575) |
-| AEH-3vi | P2 | open | Extend harbor-bench provider to support Ambient Code Platform |
-| AEH-4hy | P3 | open | Create EvalHub provider scaffold for new benchmark adapters |
-| AEH-98q | — | CLOSED | Extend Harbor to support K8s Jobs (delivered via k8s_runner.py) |
+### Steps
 
-## Next Session Focus: AEH-4hy then AEH-3vi
+1. **Build provider image:**
+   ```bash
+   docker build --platform linux/amd64 -f deploy/evalhub/Containerfile -t agent-eval-provider:latest .
+   ```
 
-### AEH-4hy: EvalHub Provider Scaffold
+2. **Push to cluster registry:**
+   ```bash
+   REGISTRY=$(oc get route default-route -n openshift-image-registry -o jsonpath='{.spec.host}')
+   docker login $REGISTRY
+   docker tag agent-eval-provider:latest $REGISTRY/evalhub/agent-eval-provider:latest
+   docker push $REGISTRY/evalhub/agent-eval-provider:latest
+   ```
 
-**Goal:** Extract a reusable scaffold from the harbor-bench provider so new benchmark providers can be created quickly.
+3. **Register provider** (if not already done from PR #30 dev):
+   ```bash
+   oc apply -f deploy/evalhub/configmap-template.yaml
+   # Add agent-eval to EvalHub CR spec.providers[] if needed
+   ```
 
-**What exists today (harbor-bench as the reference implementation):**
+4. **Create Vertex AI secret** (if not already done):
+   ```bash
+   oc create secret generic gcp-vertex-sa \
+     --from-file=sa-key.json=$HOME/.config/gcloud/jeder-sa-kind.json \
+     --from-literal=CLAUDE_CODE_USE_VERTEX=1 \
+     --from-literal=ANTHROPIC_VERTEX_PROJECT_ID=gcp-jboyer-san-gemini \
+     --from-literal=CLOUD_ML_REGION=us-east5 \
+     --from-literal=GOOGLE_APPLICATION_CREDENTIALS=/secrets/gcp/sa-key.json \
+     -n evalhub
+   ```
 
-```
-agent_eval/harbor/
-├── __init__.py
-├── adapter.py          # HarborAdapter(FrameworkAdapter) — 3 modes: harbor, k8s, import
-├── k8s_runner.py       # K8s Job lifecycle (create, poll, collect, cleanup)
-└── results_parser.py   # Parse Harbor JSON → EvalHub metrics
+5. **Submit job:**
+   ```bash
+   evalhub --base-url https://evalhub-evalhub.apps.rosa.jeder-evalhub.uqi3.p3.openshiftapps.com \
+     --token $(oc whoami -t) eval run --config deploy/evalhub/evalhub-job.yaml
+   ```
 
-deploy/harbor/
-├── Containerfile       # UBI9 provider image
-├── entrypoint.py       # Container entrypoint
-├── provider.yaml       # EvalHub provider spec (benchmarks, metrics, runtime)
-├── configmap-template.yaml
-└── generate-configmap.sh
+6. **Verify in MLflow:** Check that the run appears with judge scores and metrics.
 
-tests/
-└── test_harbor_adapter.py  # 33 unit tests
-```
+### What the provider already has baked in
 
-**The scaffold should generate for a new provider `<name>`:**
+- RFE assess rubric at `deploy/evalhub/rfe-assess/rubric.md`
+- Test case RHAIRFE-2048 at `deploy/evalhub/rfe-assess/cases/RHAIRFE-2048/input.yaml`
+- 5 judges: has_scoring_table, has_verdict, has_feedback, scores_valid, rubric_score
+- Direct LLM mode (no Claude Code CLI needed for rubric-based assessment)
 
-1. `agent_eval/<name>/__init__.py`
-2. `agent_eval/<name>/adapter.py` — with `<Name>Adapter(FrameworkAdapter)` skeleton, `run_benchmark_job()` with mode dispatch
-3. `agent_eval/<name>/results_parser.py` — skeleton for parsing benchmark-specific results
-4. `deploy/<name>/Containerfile` — UBI9 base, pip install
-5. `deploy/<name>/entrypoint.py` — with experiment name warning pattern
-6. `deploy/<name>/provider.yaml` — with placeholder benchmarks, metrics, runtime config
-7. `deploy/<name>/generate-configmap.sh`
-8. `tests/test_<name>_adapter.py` — test skeleton using the mock patterns from harbor tests
+## Architecture Context
 
-**Key patterns to preserve:**
-- `FrameworkAdapter` base class from `agent_eval.evalhub.types`
-- `_framework_adapter_init()` wrapper (avoids import failure when SDK not installed)
-- Conditional SDK imports via `agent_eval/evalhub/types.py`
-- `_report_status()` callback pattern
-- `EvaluationResult` metric mapping
-- `_setup_k8s_mocks()` test helper pattern
+**The full vision (Model Picker doc):**
 
-**Implementation approach:** A script or CLI command (`python -m agent_eval scaffold <name>`) that creates the directory structure and fills in templates. NOT a cookiecutter/copier dependency — just string templates in Python.
+Sweep orchestrator submits EvalHub jobs for each config in a matrix:
+- Planner model + tuning (Sonnet/Opus/Haiku, base/RL-tuned)
+- Planner context window
+- Planner thinking (default/ITS/extended)
+- Judge model + tuning
+- Judge context window
+- Agent (skill variant from marketplace)
 
-### AEH-3vi: Ambient Code Platform Integration
+All runs land in one MLflow experiment for comparison dashboards. Start small (single-axis model sweep), build confidence, expand to full factorial.
 
-**Goal:** Let Ambient Code Platform run Harbor benchmark tasks and push results to EvalHub/MLflow.
-
-**What the bead says:** "Ambient handles Docker-based execution; results are pushed to EvalHub/MLflow post-session. Investigate using EvalHub local runtime mode."
-
-**The provider.yaml already has local mode:**
-```yaml
-runtime:
-  local:
-    command: python3 deploy/harbor/entrypoint.py
-```
-
-**The adapter already has import mode** (`_import_results()`) that parses pre-existing Harbor results without running Harbor.
-
-**Likely approach:**
-1. Ambient runs `harbor run -p tasks/foo -a claude-code` (Docker-based, local)
-2. Results land in `jobs/` directory as `result.json` + trial subdirectories
-3. A post-run script calls the adapter in import mode to push to EvalHub/MLflow
-4. Or: Ambient calls `evalhub eval run` with a local-mode config that uses the import path
-
-**Platform repo:** `~/repos/platform` — investigate how Ambient dispatches benchmark runs and where results land.
-
-**Dependencies:** The scaffold (AEH-4hy) should be done first so the Ambient integration can follow the established provider pattern if it needs a separate provider, or extend harbor-bench if it's just a new execution mode.
-
-## Key Commands
-
-```bash
-# Run tests (agent-eval-harness)
-cd ~/repos/agent-eval-harness/.claude/worktrees/feat+harbor-provider
-python -m pytest tests/test_harbor_adapter.py -v
-
-# Local smoketest (harbor-rhoai)
-./smoketest.sh tasks/odh-operator-3290
-
-# Build task images
-./build-tasks.sh odh-operator-3290
-
-# CodeRabbit review
-coderabbit review --agent --base main        # harbor-rhoai
-coderabbit review --agent --type committed   # agent-eval-harness
-```
+**Marketplace concept:** Skills packaged as installable units, swappable in eval runtimes. Even a single skill goes through the marketplace. Open question: portability to non-Claude LLMs (skills use Claude Code-specific features).
 
 ## Cluster State: jeder-evalhub
 
 - **API:** `https://api.jeder-evalhub.uqi3.p3.openshiftapps.com:443`
-- **EvalHub:** Running, harbor-bench provider loaded
-- **MLflow:** Running, harbor-rhoai experiment has 1 run (oracle, reward=1.0)
-- **Kyverno policy:** `rewrite-eval-runtime-sidecar` active (workaround for #574)
-- **Task images:** OLD (built as root). Need rebuild+push with `./build-tasks.sh --push`
-- **gcp-vertex-sa secret:** NOT YET CREATED
-- **Still broken:** RHOAI dashboard, notebooks, kserve (stale catalog source)
+- **EvalHub:** Running, harbor-bench provider loaded (agent-eval provider may need re-registration after PR #30 merge)
+- **MLflow:** Running
+- **Kyverno policy:** `rewrite-eval-runtime-sidecar` active (workaround for upstream #574)
+- **gcp-vertex-sa secret:** Status unknown — check with `oc get secret gcp-vertex-sa -n evalhub`
 
-## Context for Resumption
+## Key References
 
-- The `feat/harbor-provider` worktree is at `~/repos/agent-eval-harness/.claude/worktrees/feat+harbor-provider/`
-- agent-eval-harness installed in dev mode: `uv pip install -e .` from the worktree
-- The `kubernetes` Python package is installed in the venv at `~/repos/.venv/`
-- Memory files at `~/.claude/projects/-Users-jeder-repos-harbor-rhoai/memory/`
-- GCP SA key for Vertex AI: `~/.config/gcloud/jeder-sa-kind.json` (project: gcp-jboyer-san-gemini, region: us-east5)
-- Task images MUST be built with `--platform linux/amd64` — `build-tasks.sh` handles this
-- Full session report at `docs/session-report-2026-05-12.md`
-- Execution flow comparison at `docs/execution-flow-comparison.md`
+- [Model Picker Google Doc](https://docs.google.com/document/d/1CgSJeIgXE9w3bVMq46BDL2-w1uUVPkB1ORJt46eNCgw)
+- [agentskills.io eval docs](https://agentskills.io/skill-creation/evaluating-skills)
+- [PR #30](https://github.com/opendatahub-io/agent-eval-harness/pull/30) — merged EvalHub provider
+- [EvalHub architecture spec](https://github.com/opendatahub-io/architecture-context/blob/main/architecture/rhoai-3.4/eval-hub.md)
+- Plan file: `~/.claude/plans/thinking-out-loud-1-graceful-kay.md`
